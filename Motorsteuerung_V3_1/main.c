@@ -635,7 +635,7 @@ static inline void _prealign_step_pwm(void)
 
                 // >>> Ergebniswinkel in [-pi,pi) <<<
                 // Hier in deine FOC/Estimator-Variablen übernehmen:
-                theta_e_rad = theta_final;     // deine globale elektrische Anfangslage
+                //theta_e_rad = theta_final;     // deine globale elektrische Anfangslage
 
                 // Prealignment beendet:
                 preAlignment.st = INJ_IDLE;
