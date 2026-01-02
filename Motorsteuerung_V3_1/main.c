@@ -373,7 +373,7 @@ static inline void _inv_clarke_abc(float32_t alpha, float32_t beta, float32_t *a
 /* TODO: Has to be documented */
 static inline void _svpwm()
 {
-	// Hallo Hausberger
+	// Hallo Hausberger Cheffe
 }
 /******************************************************************************/
 
