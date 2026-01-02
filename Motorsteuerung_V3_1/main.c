@@ -160,6 +160,9 @@ typedef struct
     uint8_t stage;              // 0 coarse, 1 fine15, 2 fine7p5, 3 polarity
     float32_t theta_est_rad;    // Result (rad)
     bool theta_polar_is_north;
+    
+    float32_t theta_e_rad_final;
+    bool theta_e_rad_final_ready;
 
 } prealign_t;
 
@@ -258,6 +261,7 @@ static inline void _prepare_six_around(prealign_t *p, float32_t theta0, float32_
 static inline void _prepare_polarity(prealign_t *p, float32_t theta0);
 static inline void _prealign_start(void);
 static inline void _prealign_step_pwm(void);
+static inline float32_t _DEG2RAD_F(float32_t x);
 
 
 /*******************************************************************************
@@ -373,7 +377,7 @@ static inline void _inv_clarke_abc(float32_t alpha, float32_t beta, float32_t *a
 /* TODO: Has to be documented */
 static inline void _svpwm()
 {
-	// Hallo Hausberger Cheffe
+	
 }
 /******************************************************************************/
 
@@ -384,7 +388,7 @@ static inline void _svpwm()
 *******************************************************************************/
 static inline void _apply_vector_rad(float32_t theta_rad, float32_t m)
 {
-    theta_rad = wrap_pi(theta_rad);
+    theta_rad = _wrap_pi(theta_rad);
 
     float32_t Vmag = m * (adc_meas.vdc * ONE_o_SQRT3);
     invClarkeVoltage.alpha = Vmag * cosf(theta_rad);
@@ -410,7 +414,7 @@ static inline void _prepare_coarse(prealign_t *p)
     for (int i = 0; i < 12; i++)
     {
         float32_t th = (float32_t)i * (PI/6.0f);  // 30°
-        p->theta_list[i] = wrap_pi(th);
+        p->theta_list[i] = _wrap_pi(th);
         p->peaks[i] = 0.0f;
     }
 }
@@ -423,7 +427,7 @@ static inline void _prepare_six_around(prealign_t *p, float32_t theta0, float32_
 
     for (int i = 0; i < 6; i++)
     {
-        p->theta_list[i] = wrap_pi(theta0 + k[i] * delta_rad);
+        p->theta_list[i] = _wrap_pi(theta0 + k[i] * delta_rad);
         p->peaks[i] = 0.0f;
     }
 }
@@ -432,8 +436,8 @@ static inline void _prepare_polarity(prealign_t *p, float32_t theta0)
 {
     p->theta_count = 2;
     p->idx = 0;
-    p->theta_list[0] = wrap_pi(theta0);
-    p->theta_list[1] = wrap_pi(theta0 + PI);
+    p->theta_list[0] = _wrap_pi(theta0);
+    p->theta_list[1] = _wrap_pi(theta0 + PI);
     p->peaks[0] = p->peaks[1] = 0.0f;
 }
 /******************************************************************************/
@@ -448,6 +452,17 @@ static inline float32_t _wrap_pi(float32_t x)
     while (x >= PI)  x -= TWO_PI;
     while (x < -PI)  x += TWO_PI;
     return x;
+}
+/******************************************************************************/
+
+/*******************************************************************************
+* Function Name: static inline float32_t _DEG2RAD_F(float32_t x)
+
+* Function used to calcultate deg out of rad
+*******************************************************************************/
+static inline float32_t _DEG2RAD_F(float32_t x)
+{
+    return x/360.0*PI;
 }
 /******************************************************************************/
 
@@ -503,7 +518,7 @@ void pwm_reload_intr_handler()
     {
         if (system_state == SYSTEM_PRE_ALIGNMENT)
         {
-            prealign_step_pwm();
+            _prealign_step_pwm();
         }
         // else: später SYSTEM_READY -> FOC Control Loop
     }
@@ -522,9 +537,11 @@ static inline void _prealign_start(void)
 
     preAlignment.st = INJ_NEXT;
     preAlignment.stage = 0;
-
+	
+	preAlignment.theta_e_rad_final_ready = false;
+	NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
     preAlignment.inj_m = M_COARSE;
-    prepare_coarse(&preAlignment);
+    _prepare_coarse(&preAlignment);
 }
 /******************************************************************************/
 
@@ -549,7 +566,7 @@ static inline void _prealign_step_pwm(void)
             }
 
             float32_t th = preAlignment.theta_list[preAlignment.idx];
-            apply_vector_rad(th, preAlignment.inj_m);
+            _apply_vector_rad(th, preAlignment.inj_m);
 
             // Zyklen je nach Stage/Magnitude
             if (preAlignment.stage == 0) {
@@ -595,7 +612,7 @@ static inline void _prealign_step_pwm(void)
         case INJ_DONE:
         {
             // Bestes theta0 finden
-            int k = argmax_f32(preAlignment.peaks, preAlignment.theta_count);
+            int k = _argmax_f32(preAlignment.peaks, preAlignment.theta_count);
             float32_t theta0 = preAlignment.theta_list[k];
 
             if (preAlignment.stage == 0)
@@ -603,7 +620,7 @@ static inline void _prealign_step_pwm(void)
                 // fein um theta0, delta=15° (in rad)
                 preAlignment.stage = 1;
                 preAlignment.inj_m = M_FINE;
-                prepare_six_around(&preAlignment, theta0, DEG2RAD_F(15.0f));
+                _prepare_six_around(&preAlignment, theta0, _DEG2RAD_F(15.0f));
                 preAlignment.st = INJ_NEXT;
             }
             else if (preAlignment.stage == 1)
@@ -611,7 +628,7 @@ static inline void _prealign_step_pwm(void)
                 // noch feiner, delta=7.5°
                 preAlignment.stage = 2;
                 preAlignment.inj_m = M_FINE;
-                prepare_six_around(&preAlignment, theta0, DEG2RAD_F(7.5f));
+                _prepare_six_around(&preAlignment, theta0, _DEG2RAD_F(7.5f));
                 preAlignment.st = INJ_NEXT;
             }
             else if (preAlignment.stage == 2)
@@ -620,23 +637,24 @@ static inline void _prealign_step_pwm(void)
                 preAlignment.stage = 3;
                 preAlignment.inj_m = M_POL;
                 preAlignment.theta_est_rad = theta0;
-                prepare_polarity(&preAlignment, theta0);
+                _prepare_polarity(&preAlignment, theta0);
                 preAlignment.st = INJ_NEXT;
             }
             else
             {
                 // stage==3 -> Polarität auswerten
-                int k2 = argmax_f32(preAlignment.peaks, 2);
+                int k2 = _argmax_f32(preAlignment.peaks, 2);
                 preAlignment.theta_polar_is_north = (k2 == 0);
 
                 // Wenn das größere Peak bei theta+pi ist -> Winkel um pi drehen
                 float32_t theta_final = preAlignment.theta_est_rad;
-                if (k2 == 1) theta_final = wrap_pi(theta_final + PI);
+                if (k2 == 1) theta_final = _wrap_pi(theta_final + PI);
 
                 // >>> Ergebniswinkel in [-pi,pi) <<<
                 // Hier in deine FOC/Estimator-Variablen übernehmen:
-                theta_e_rad = theta_final;     // deine globale elektrische Anfangslage
-
+                preAlignment.theta_e_rad_final = theta_final;     // deine globale elektrische Anfangslage
+				preAlignment.theta_e_rad_final_ready = true;
+				NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
                 // Prealignment beendet:
                 preAlignment.st = INJ_IDLE;
                 system_state = SYSTEM_READY;
@@ -933,7 +951,6 @@ void calibration_init()
 		Cy_TCPWM_PWM_SetPeriod0(PWM_Counter_W_HW, PWM_Counter_W_NUM, PWM_PeriodVal);
 	}
 	
-	NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
 	NVIC_EnableIRQ(fifo_isr_cfg.intrSrc);
 	adc_calibration_start_lowside_clamp(2048u, 64u);
 	low_sides_all_on();
@@ -1030,9 +1047,28 @@ int main(void)
     __enable_irq();
     
     init();
+    static bool button_pressed_before = false;
 
     for (;;)
     {
+		if (Cy_GPIO_Read(SW2_PORT, SW2_NUM) == 1UL && button_pressed_before == false)
+		{
+			button_pressed_before = true;
+	        switch (system_state)
+	        {
+	            case SYSTEM_READY:
+					NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
+	                break;
+
+	
+	            default:
+	                break;
+	        }
+		}
+		else if (Cy_GPIO_Read(SW2_PORT, SW2_NUM) == 0UL)
+		{
+			button_pressed_before = false;
+		}
     }
 }
 
