@@ -375,9 +375,58 @@ static inline void _inv_clarke_abc(float32_t alpha, float32_t beta, float32_t *a
 * -
 *******************************************************************************/
 /* TODO: Has to be documented */
-static inline void _svpwm()
-{
+static inline void _svpwm(float32_t Va, float32_t Vb, float32_t Vc, float32_t overmod)
+{	
+	float32_t Vmax = fmaxf(fmaxf(Va, Vb), Vc);
+	float32_t Vmin = fminf(fminf(Va, Vb), Vc);
+	float32_t Voff = -0.5*(Vmax+Vmin);
 	
+	Va += Voff; Vb += Voff; Vc += Voff;
+	
+	if (overmod > 0.0f)
+	{
+		float32_t scale = 1.0f + 0.15f * _sat(overmod,0.0f,1.0f);
+		Va *= scale; Vb *= scale; Vc *= scale;
+	}
+	
+	float32_t Vdc = adc_meas.vdc;
+	
+	float32_t da = _sat(0.5f + Va / Vdc, 0.0f, 1.0f);
+	float32_t db = _sat(0.5f + Vb / Vdc, 0.0f, 1.0f);
+	float32_t dc = _sat(0.5f + Vc / Vdc, 0.0f, 1.0f);
+	
+	uint32_t PWM_Period = Cy_TCPWM_PWM_GetPeriod0(PWM_Counter_U_HW, PWM_Counter_U_NUM);
+	
+	uint32_t compareU = PWM_Period * da;
+	uint32_t compareV = PWM_Period * db;
+	uint32_t compareW = PWM_Period * dc;
+	
+	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_U_HW, PWM_Counter_U_NUM, compareU);
+	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_V_HW, PWM_Counter_V_NUM, compareV);
+	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_W_HW, PWM_Counter_W_NUM, compareW);
+	
+	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_U_HW, PWM_Counter_U_NUM);
+	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_V_HW, PWM_Counter_V_NUM);
+	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_W_HW, PWM_Counter_W_NUM);	
+}
+/******************************************************************************/
+
+/*******************************************************************************
+* Function Name: static inline void _svpwm()
+
+* -
+*******************************************************************************/
+/* TODO: Has to be documented */
+static inline void _Block(float32_t Va, float32_t Vb, float32_t Vc, float32_t overmod)
+{	
+		
+	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_U_HW, PWM_Counter_U_NUM, compareU);
+	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_V_HW, PWM_Counter_V_NUM, compareV);
+	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_W_HW, PWM_Counter_W_NUM, compareW);
+	
+	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_U_HW, PWM_Counter_U_NUM);
+	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_V_HW, PWM_Counter_V_NUM);
+	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_W_HW, PWM_Counter_W_NUM);	
 }
 /******************************************************************************/
 
@@ -655,6 +704,7 @@ static inline void _prealign_step_pwm(void)
                 preAlignment.theta_e_rad_final = theta_final;     // deine globale elektrische Anfangslage
 				preAlignment.theta_e_rad_final_ready = true;
 				NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
+				printf("%0.2f", preAlignment.theta_e_rad_final);
                 // Prealignment beendet:
                 preAlignment.st = INJ_IDLE;
                 system_state = SYSTEM_READY;
@@ -697,6 +747,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 			if (adc_calibration.done)
             {
 				system_state = SYSTEM_READY;
+				_prealign_start();
             }
 		}
 		else
