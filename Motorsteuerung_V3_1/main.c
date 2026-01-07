@@ -188,6 +188,20 @@ typedef struct
 #define ONE_o_SQRT3     0.5773502692f
 #define ONE_o_THREE     0.3333333333f
 
+// Block defines
+// LUT_SIZE for Block
+#define LUT_SIZE 6
+
+// Values for High, Low and High Z
+#define HIGH                                1
+#define LOW                                -1
+#define OFF                                 0
+
+// Values for Phases 
+#define A                                   0
+#define B                                   1
+#define C                                   2
+
 
 /*******************************************************************************
 * Macros
@@ -262,7 +276,9 @@ static inline void _prepare_polarity(prealign_t *p, float32_t theta0);
 static inline void _prealign_start(void);
 static inline void _prealign_step_pwm(void);
 static inline float32_t _DEG2RAD_F(float32_t x);
-
+static inline void _svpwm(float32_t Va, float32_t Vb, float32_t Vc, float32_t overmod);
+void set_PWM(TCPWM_Type* hw, uint32_t num, uint8_t phase, int16_t lut_array[LUT_SIZE][3],uint8_t lut_idx, float32_t duty);
+inline float32_t _sat(float32_t x, float32_t min, float32_t max);
 
 /*******************************************************************************
 * Function Definitions
@@ -417,16 +433,66 @@ static inline void _svpwm(float32_t Va, float32_t Vb, float32_t Vc, float32_t ov
 * -
 *******************************************************************************/
 /* TODO: Has to be documented */
-static inline void _Block(float32_t Va, float32_t Vb, float32_t Vc, float32_t overmod)
+static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_math_pos)
 {	
-		
-	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_U_HW, PWM_Counter_U_NUM, compareU);
-	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_V_HW, PWM_Counter_V_NUM, compareV);
-	Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_W_HW, PWM_Counter_W_NUM, compareW);
+	/*TODO: Check if Arrays are correct for clock and countclockwise*/
+	static int16_t lut[LUT_SIZE][3] =
+	{
+		{ HIGH, LOW,  OFF },   // Zustand 1: U+ V- W offen
+	    { HIGH, OFF, LOW },    // Zustand 2: U+ W- V offen
+	    { OFF, HIGH, LOW },    // Zustand 3: V+ W- U offen
+	    { LOW, HIGH, OFF },    // Zustand 4: V+ U- W offen
+	    { LOW, OFF, HIGH },    // Zustand 5: W+ U- V offen
+	    { OFF, LOW, HIGH }     // Zustand 6: W+ V- U offen
+	};
+
+	static int16_t cclut[LUT_SIZE][3] = 
+	{
+		{HIGH, OFF, LOW},
+		{OFF, HIGH, LOW},
+		{LOW, HIGH, OFF},
+		{LOW, OFF, HIGH},
+		{OFF, LOW, HIGH},
+		{HIGH, LOW,  OFF}
+	};
 	
-	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_U_HW, PWM_Counter_U_NUM);
-	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_V_HW, PWM_Counter_V_NUM);
-	Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_W_HW, PWM_Counter_W_NUM);	
+	if (direction_is_math_pos == true)
+	{
+		set_PWM(PWM_Counter_U_HW, PWM_Counter_U_NUM, A, cclut, lut_idx, Duty);
+		set_PWM(PWM_Counter_V_HW, PWM_Counter_V_NUM, B, cclut, lut_idx, Duty);
+		set_PWM(PWM_Counter_W_HW, PWM_Counter_W_NUM, C, cclut, lut_idx, Duty);
+	}
+	else 
+	{
+		set_PWM(PWM_Counter_U_HW, PWM_Counter_U_NUM, A, lut, lut_idx, Duty);
+		set_PWM(PWM_Counter_V_HW, PWM_Counter_V_NUM, B, lut, lut_idx, Duty);
+		set_PWM(PWM_Counter_W_HW, PWM_Counter_W_NUM, C, lut, lut_idx, Duty);
+	}
+}
+
+void set_PWM(TCPWM_Type* hw, uint32_t num, uint8_t phase, int16_t lut_array[LUT_SIZE][3],uint8_t lut_idx, float32_t duty)
+{
+	uint32_t compare = (uint32_t)(Cy_TCPWM_PWM_GetPeriod0(hw, num) * duty);
+	
+	switch(lut_array[lut_idx][phase])
+		{
+			case HIGH:
+				Cy_TCPWM_PWM_Enable(hw, num);
+				Cy_TCPWM_PWM_SetCompare0BufVal(hw, num, compare);
+				Cy_TCPWM_TriggerCaptureOrSwap_Single(hw, num);
+				break;
+			
+			case LOW:
+				Cy_TCPWM_PWM_Enable(hw, num);
+				Cy_TCPWM_PWM_SetCompare0BufVal(hw, num, 0);
+				Cy_TCPWM_TriggerCaptureOrSwap_Single(hw, num);
+				break;
+			
+			case OFF:
+				Cy_TCPWM_PWM_Disable(hw, num);
+				break;
+				
+		}
 }
 /******************************************************************************/
 
@@ -442,8 +508,9 @@ static inline void _apply_vector_rad(float32_t theta_rad, float32_t m)
     float32_t Vmag = m * (adc_meas.vdc * ONE_o_SQRT3);
     invClarkeVoltage.alpha = Vmag * cosf(theta_rad);
     invClarkeVoltage.beta  = Vmag * sinf(theta_rad);
-
-    _svpwm(invClarkeVoltage.alpha, invClarkeVoltage.beta, adc_meas.vdc);
+	float32_t va, vb, vc;
+	_inv_clarke_abc(invClarkeVoltage.alpha, invClarkeVoltage.beta, &va, &vb, &vc);
+    _svpwm(va, vb, vc, 0.0);
 }
 /******************************************************************************/
 
@@ -501,6 +568,19 @@ static inline float32_t _wrap_pi(float32_t x)
     while (x >= PI)  x -= TWO_PI;
     while (x < -PI)  x += TWO_PI;
     return x;
+}
+/******************************************************************************/
+
+/*******************************************************************************
+* Function Name: inline float32_t _sat(float32_t x, float32_t min, float32_t max)
+
+* Function satuats between max and min value
+*******************************************************************************/
+inline float32_t _sat(float32_t x, float32_t min, float32_t max)
+{
+	if(x < min) return min;
+	if(x > max) return max;
+	return x;
 }
 /******************************************************************************/
 
@@ -617,14 +697,19 @@ static inline void _prealign_step_pwm(void)
             float32_t th = preAlignment.theta_list[preAlignment.idx];
             _apply_vector_rad(th, preAlignment.inj_m);
 
-            // Zyklen je nach Stage/Magnitude
-            if (preAlignment.stage == 0) {
+            // per cycle
+            if (preAlignment.stage == 0) 
+            {
                 preAlignment.on_cycles  = INJ_ON_CYCLES_COARSE;
                 preAlignment.off_cycles = INJ_OFF_CYCLES_COARSE;
-            } else if (preAlignment.stage == 1 || preAlignment.stage == 2) {
+            } 
+            else if (preAlignment.stage == 1 || preAlignment.stage == 2) 
+            {
                 preAlignment.on_cycles  = INJ_ON_CYCLES_FINE;
                 preAlignment.off_cycles = INJ_OFF_CYCLES_FINE;
-            } else {
+            } 
+            else 
+            {
                 preAlignment.on_cycles  = INJ_ON_CYCLES_POL;
                 preAlignment.off_cycles = INJ_OFF_CYCLES_POL;
             }
@@ -635,8 +720,8 @@ static inline void _prealign_step_pwm(void)
 
         case INJ_ON:
         {
-            // In den letzten 1–2 PWM Perioden Sample freigeben
-            if (preAlignment.on_cycles == 2) {
+            if (preAlignment.on_cycles == 2) 
+            {
                 inj_collect_now = true;   // ADC-ISR nimmt jetzt last_imag
             }
 
@@ -707,10 +792,8 @@ static inline void _prealign_step_pwm(void)
 				printf("%0.2f", preAlignment.theta_e_rad_final);
                 // Prealignment beendet:
                 preAlignment.st = INJ_IDLE;
-                system_state = SYSTEM_READY;
+                //system_state = SYSTEM_READY;
 
-                // Optional: Prealignment-ISR deaktivieren, Controller starten usw.
-                // NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
                 // Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
             }
         } break;
@@ -1108,7 +1191,8 @@ int main(void)
 	        switch (system_state)
 	        {
 	            case SYSTEM_READY:
-					NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
+	            	system_state = SYSTEM_PRE_ALIGNMENT;
+					NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
 	                break;
 
 	
