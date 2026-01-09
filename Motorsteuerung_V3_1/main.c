@@ -1,4 +1,3 @@
-
 /*******************************************************************************
 * Header Files
 *******************************************************************************/
@@ -167,18 +166,18 @@ typedef struct
 } prealign_t;
 
 // Params for pre alignment
-#define M_COARSE              (0.10f)
-#define M_FINE                (0.06f)
-#define M_POL                 (0.08f)
+#define M_COARSE              (0.1f)
+#define M_FINE                (0.1f)
+#define M_POL                 (0.1f)
 
-#define INJ_ON_CYCLES_COARSE  (40)
-#define INJ_OFF_CYCLES_COARSE (40)
+#define INJ_ON_CYCLES_COARSE  (3)
+#define INJ_OFF_CYCLES_COARSE (12)
 
-#define INJ_ON_CYCLES_FINE    (60)
-#define INJ_OFF_CYCLES_FINE   (60)
+#define INJ_ON_CYCLES_FINE    (4)
+#define INJ_OFF_CYCLES_FINE   (16)
 
-#define INJ_ON_CYCLES_POL     (80)
-#define INJ_OFF_CYCLES_POL    (80)
+#define INJ_ON_CYCLES_POL     (8)
+#define INJ_OFF_CYCLES_POL    (32)
 
 // Values
 #define TWO_PI          6.2831853072f
@@ -243,6 +242,7 @@ static volatile dq_t invParkVoltage;
 // prealignment
 static prealign_t preAlignment;
 volatile bool inj_collect_now = false;     // gets true in ON
+static volatile float32_t inj_theta_now = 0.0f;
 volatile float32_t last_imag = 0.0f;       // ADC-ISR writes values in Peak
 /*******************************************************************************
 * Functions
@@ -591,7 +591,7 @@ inline float32_t _sat(float32_t x, float32_t min, float32_t max)
 *******************************************************************************/
 static inline float32_t _DEG2RAD_F(float32_t x)
 {
-    return x/360.0*PI;
+    return x*(PI/180.0f);
 }
 /******************************************************************************/
 
@@ -666,7 +666,7 @@ static inline void _prealign_start(void)
 
     preAlignment.st = INJ_NEXT;
     preAlignment.stage = 0;
-	
+	inj_theta_now = 0.0f;
 	preAlignment.theta_e_rad_final_ready = false;
 	NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
     preAlignment.inj_m = M_COARSE;
@@ -693,8 +693,11 @@ static inline void _prealign_step_pwm(void)
                 preAlignment.st = INJ_DONE;
                 break;
             }
-
+			
+			last_imag = 0.0f;
             float32_t th = preAlignment.theta_list[preAlignment.idx];
+     		
+            inj_theta_now = th;
             _apply_vector_rad(th, preAlignment.inj_m);
 
             // per cycle
@@ -789,10 +792,9 @@ static inline void _prealign_step_pwm(void)
                 preAlignment.theta_e_rad_final = theta_final;     // deine globale elektrische Anfangslage
 				preAlignment.theta_e_rad_final_ready = true;
 				NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
-				printf("%0.2f", preAlignment.theta_e_rad_final);
                 // Prealignment beendet:
                 preAlignment.st = INJ_IDLE;
-                //system_state = SYSTEM_READY;
+                //system_state =;
 
                 // Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
             }
@@ -838,6 +840,20 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
             adc_frame_t frame = _adc_unpack_frame(adc_data, adc_chan, count);
             _adc_frame_to_si(&frame, &adc_meas);
         }
+        
+        if (system_state == SYSTEM_PRE_ALIGNMENT && inj_collect_now)
+        {
+			float32_t ialpha, ibeta;
+		    _clarke_ab(adc_meas.iu, adc_meas.iv, adc_meas.iw, &ialpha, &ibeta);
+		
+		    float32_t s = sinf(inj_theta_now);
+		    float32_t c = cosf(inj_theta_now);
+		
+		    float32_t id = c*ialpha + s*ibeta;
+		    last_imag = fabsf(id);
+		
+		    inj_collect_now = false;
+		}
 		
         Cy_HPPASS_FIFO_ClearInterrupt(CY_HPPASS_INTR_FIFO_0_LEVEL);
     }
@@ -1194,6 +1210,12 @@ int main(void)
 	            	system_state = SYSTEM_PRE_ALIGNMENT;
 					NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
 	                break;
+	            
+	            // only for testing
+	            case SYSTEM_PRE_ALIGNMENT:
+					_prealign_start();
+	            	NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
+	            	break;
 
 	
 	            default:
@@ -1203,6 +1225,12 @@ int main(void)
 		else if (Cy_GPIO_Read(SW2_PORT, SW2_NUM) == 0UL)
 		{
 			button_pressed_before = false;
+		}
+		
+		if (preAlignment.theta_e_rad_final_ready)
+		{
+		    preAlignment.theta_e_rad_final_ready = false;
+		    printf("theta_e = %.3f rad\r\n", preAlignment.theta_e_rad_final);
 		}
     }
 }
