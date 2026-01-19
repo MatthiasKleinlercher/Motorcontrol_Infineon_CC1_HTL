@@ -165,6 +165,58 @@ typedef struct
 
 } prealign_t;
 
+
+// Slide Mode Observer Variablen
+typedef struct
+{
+	// ---- Motor/System Konstanten ----
+	float32_t R; //Strangwiderstand
+	float32_t L; //Stanginduktivität
+	float32_t Ts; // Abtastzeit
+	float32_t fs; // Abtastfrequenz
+	float32_t p; //Poolparzahl
+	
+	// ---- LPF auf Back-EMF ----
+	float32_t w_e0_emf; // LPF-Bandbreite
+	float32_t k0; //LPF-Koeffizient k0 = w_e0_emf/fs
+	float32_t alpha_emf; // EMF-Filter-Grenzfrequenz [rad/s]
+	float32_t ealpha_f; //LPF Zustand alpha
+	float32_t ebeta_f; //LPF-Zustand beta
+	
+	// ---- Vorherige Werte ----
+	float32_t i_alpha_prev;
+	float32_t i_beta_prev;
+	float32_t theta_hat;
+	float32_t omega_hat; 
+	float32_t theta_prev;
+	float32_t Kp_pll;
+	float32_t Ki_pll;
+	float32_t integ_e;
+	float32_t theta_emf_raw;
+	// ---- Ergebnisse ----
+	float32_t theta_rad; //{0;2PI}
+	float32_t w_rad_s;
+	float32_t n;
+	float32_t omega_hat_f;
+	float32_t alpha_omega;
+	int8_t direction;
+	float32_t theta_shift;
+} smo_t;
+smo_t SMO;
+
+// PI controller struct
+typedef struct 
+{
+    float32_t kp;       // proportional gain
+    float32_t ki;       // integral gain (per second)
+    float32_t Ts;       // sample time [s]
+    float32_t out_min;  // actuator min
+    float32_t out_max;  // actuator max
+    float32_t prevU;
+    float32_t prevE;
+    bool useIntFlag;
+} PI_t;
+
 // Params for pre alignment
 #define M_COARSE              (0.1f)
 #define M_FINE                (0.1f)
@@ -200,8 +252,27 @@ typedef struct
 #define A                                   0
 #define B                                   1
 #define C                                   2
-// Test
 
+
+// Startup frequenzy
+#define we_startUp 800.0
+
+//Controller Interrupt Time
+#define CONTROLLER_INTERRUPT_TIME 0.00004
+
+// Voltage supoply
+#define VDD 36.0
+
+// print global vars
+typedef struct
+{
+	float32_t we;
+	float32_t we_OBS;
+	float32_t id;
+	float32_t iq;
+	float32_t vd;
+	float32_t vq;
+}Print_t;
 /*******************************************************************************
 * Macros
 *******************************************************************************/
@@ -212,7 +283,7 @@ typedef struct
 *******************************************************************************/
 
 // Finite State Machine
-typedef enum {SYSTEM_OFF, SYSTEM_INIT, SYSTEM_CALIBRATION, SYSTEM_READY, SYSTEM_PRE_ALIGNMENT} system_state_t;
+typedef enum {SYSTEM_OFF, SYSTEM_INIT, SYSTEM_CALIBRATION, SYSTEM_READY, SYSTEM_PRE_ALIGNMENT, SYSTEM_OPEN_LOOP_START_FOC, SYSTEM_CLOSED_LOOP_FOC} system_state_t;
 volatile system_state_t system_state = SYSTEM_OFF;
 
 // Interruptconfig
@@ -229,21 +300,25 @@ static cy_stc_scb_uart_context_t DEBUG_UART_context;
 static mtb_hal_uart_t DEBUG_UART_hal_obj;
 
 // ADC - Calibration
-static adc_cal_ls_clamp_t adc_calibration;
+volatile adc_cal_ls_clamp_t adc_calibration;
 
 // ADC - meas values with voltage and current data
-static volatile  meas_si_t adc_meas;
-static volatile bool adc_meas_valid = false;
+volatile  meas_si_t adc_meas;
+volatile bool adc_meas_valid = false;
 
 // calculated voltages for transformation
-static volatile ab_t invClarkeVoltage;
-static volatile dq_t invParkVoltage;
+volatile ab_t invClarkeVoltage;
+volatile dq_t invParkVoltage;
 
 // prealignment
-static prealign_t preAlignment;
+volatile prealign_t preAlignment;
 volatile bool inj_collect_now = false;     // gets true in ON
-static volatile float32_t inj_theta_now = 0.0f;
+volatile float32_t inj_theta_now = 0.0f;
 volatile float32_t last_imag = 0.0f;       // ADC-ISR writes values in Peak
+
+// Test Vars
+volatile Print_t PrintVars;
+volatile float32_t iq_ref = 1.0;
 /*******************************************************************************
 * Functions
 *******************************************************************************/
@@ -254,7 +329,7 @@ void pwm_reload_intr_handler();
 void controller_counter_intr_handler();
 void speed_measurment_intr_handler();
 void adc_calibration_start_lowside_clamp(uint32_t target_samples, uint32_t warmup_samples);
-static inline bool _cal_all_done(const adc_cal_ls_clamp_t *c);
+static inline bool _cal_all_done(adc_cal_ls_clamp_t *c);
 void adc_calibration_feed_lowside_clamp(const int16_t *data, const uint8_t *chan, uint8_t n);
 static inline int16_t _adc_apply_offset(int16_t raw, int16_t off);
 void low_sides_all_on(void);
@@ -262,7 +337,7 @@ void high_sides_all_on(void);
 static inline float32_t _adc_to_amp_i16(int16_t adc_raw, int16_t adc_off, float32_t k);
 static inline float32_t _adc_to_volt_i16(int16_t adc_raw, int16_t adc_off, float32_t k, float32_t b);
 static inline adc_frame_t _adc_unpack_frame(const int16_t *data, const uint8_t *chan, uint8_t n);
-static inline bool _adc_frame_to_si(const adc_frame_t *f, meas_si_t *out);
+static inline bool _adc_frame_to_si(const adc_frame_t *f, volatile meas_si_t *out);
 static inline void _clarke_ab(float32_t ia, float32_t ib, float32_t ic, float32_t *alpha, float32_t *beta);
 static inline void _park_dq(float32_t alpha, float32_t beta, float32_t s, float32_t c, float32_t *d, float32_t *q);
 static inline void _inv_park_ab(float32_t d, float32_t q, float32_t s, float32_t c, float32_t *alpha, float32_t *beta);
@@ -278,7 +353,17 @@ static inline void _prealign_step_pwm(void);
 static inline float32_t _DEG2RAD_F(float32_t x);
 static inline void _svpwm(float32_t Va, float32_t Vb, float32_t Vc, float32_t overmod);
 void set_PWM(TCPWM_Type* hw, uint32_t num, uint8_t phase, int16_t lut_array[LUT_SIZE][3],uint8_t lut_idx, float32_t duty);
-inline float32_t _sat(float32_t x, float32_t min, float32_t max);
+static inline float32_t _sat(float32_t x, float32_t min, float32_t max);
+void SMO_Init(smo_t *smo);
+static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, float32_t vAlpha, float32_t vBeta);
+static inline float32_t _SMO_GetTheta(const smo_t* smo);
+static inline float32_t _SMO_GetOmega(const smo_t* smo);
+static inline float32_t _SMO_GetSpeed(const smo_t* smo);
+static inline float32_t _pi_controller_step(PI_t *c, float32_t setpoint, float32_t measurement);
+void init_pi_d(PI_t *d, float32_t vd);
+void init_pi_q(PI_t *q, float32_t vq);
+static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we);
+				 
 
 /*******************************************************************************
 * Function Definitions
@@ -576,7 +661,7 @@ static inline float32_t _wrap_pi(float32_t x)
 
 * Function satuats between max and min value
 *******************************************************************************/
-inline float32_t _sat(float32_t x, float32_t min, float32_t max)
+static inline float32_t _sat(float32_t x, float32_t min, float32_t max)
 {
 	if(x < min) return min;
 	if(x > max) return max;
@@ -623,6 +708,140 @@ void speed_measurment_intr_handler()
 /******************************************************************************/
 
 /*******************************************************************************
+* Function Name: void SMO_Init(smo_t *smo)
+				 void inline _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, float32_t vAlpha, float32_t vBeta)
+				 static inline float32_t _SMO_GetTheta(const smo_t* smo)
+				 static inline float32_t _SMO_GetOmega(const smo_t* smo)
+				 static inline float32_t _SMO_GetSpeed(const smo_t* smo)
+				 
+* All function for Slidemode Observer to calc. the rotor angle
+*******************************************************************************/
+
+void SMO_Init(smo_t *smo)
+{
+	smo->R = 0.035;
+    smo->L = 0.000086;
+    smo->Ts = CONTROLLER_INTERRUPT_TIME;
+    smo->fs = 1.0/CONTROLLER_INTERRUPT_TIME;
+    smo->p  = 4.0;
+    
+    smo->ealpha_f = 0.0f;  smo->ebeta_f = 0.0f;
+    smo->i_alpha_prev = 0.0f;  smo->i_beta_prev = 0.0f;
+    smo->theta_prev = 0.0f;
+    
+    // PLL-Startwerte (z.B. aus deinem Open-Loop)
+    smo->theta_hat = 0.0f;
+    smo->omega_hat = 0.0f;
+    smo->integ_e   = 0.0f;
+
+    // Faustregler (für Start): Kp ~ 2*w_pll, Ki ~ (w_pll)^2; w_pll << w0_emf
+    const float w_pll = 2.0f * 3.14159265f * 15.0f;   // 15 Hz
+    smo->Kp_pll = 1.4f * w_pll;
+    smo->Ki_pll = (w_pll*w_pll);
+    smo->theta_emf_raw = 0.0f;
+    
+    smo->w_e0_emf = w_pll * 6.0;
+    smo->alpha_emf = 1.0f - expf(-smo->w_e0_emf * smo->Ts);
+    if (smo->alpha_emf > 1.0f) smo->alpha_emf = 1.0f;
+    if (smo->alpha_emf < 0.0f) smo->alpha_emf = 0.0f;
+    
+    smo->theta_rad = 0.0;
+    smo->w_rad_s = 0.0f;
+    
+    // optionale ω-Glättung
+    const float w_omega = 2.0f * 3.14159265f * 20.0f; // 20 Hz
+    smo->alpha_omega = 1.0f - expf(-w_omega * smo->Ts);
+    
+    smo->omega_hat_f = 0.0f;
+    
+    smo->theta_shift = 0.36f;
+}
+
+static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, float32_t vAlpha, float32_t vBeta)
+{
+	const float32_t di_alpha = (iAlpha - smo->i_alpha_prev) * smo->fs;
+    const float32_t di_beta  = (iBeta  - smo->i_beta_prev)  * smo->fs;
+	
+	// EMF = v - R*i - L*di/dt
+    float32_t e_alpha = vAlpha - (smo->R * iAlpha) - (smo->L * di_alpha);
+    float32_t e_beta  = vBeta  - (smo->R * iBeta)  - (smo->L * di_beta);
+	
+	const float32_t a = smo->alpha_emf;
+    smo->ealpha_f += a * (e_alpha - smo->ealpha_f);
+    smo->ebeta_f  += a * (e_beta  - smo->ebeta_f);
+	
+	float32_t e_theta = -((smo->ebeta_f * sinf(smo->theta_hat)) + (smo->ealpha_f * cosf(smo->theta_hat)));
+	
+	// PLL mit einfachem Antiwindup
+    const float OMEGA_MAX = 6720.0f;
+    float32_t omega_u = smo->Kp_pll * e_theta + smo->integ_e;
+    float32_t omega_limited = fminf(fmaxf(omega_u, -OMEGA_MAX), OMEGA_MAX);
+    smo->omega_hat = omega_limited;
+    
+    // Back-calculation (k_aw ≈ ω_n)
+    const float k_aw = 2.0f * 3.14159265f * 15.0f;
+    smo->integ_e += (smo->Ki_pll * e_theta + (omega_limited - omega_u) * k_aw) * smo->Ts;
+	
+    smo->theta_hat = _wrap_pi(smo->theta_hat + smo->Ts * smo->omega_hat);
+    smo->theta_rad = _wrap_pi(smo->theta_hat + smo->theta_shift);
+
+    // w-Glättung (für Anzeige)
+    smo->omega_hat_f += smo->alpha_omega * (smo->omega_hat - smo->omega_hat_f);
+
+    smo->i_alpha_prev = iAlpha;
+    smo->i_beta_prev  = iBeta;
+}
+
+
+static inline float32_t _SMO_GetTheta(const smo_t* smo){ return smo->theta_rad; }
+static inline float32_t _SMO_GetOmega(const smo_t* smo){ return smo->omega_hat; }
+static inline float32_t _SMO_GetSpeed(const smo_t* smo){ return smo->omega_hat/(TWO_PI*smo->p*smo->p)*60;}
+/******************************************************************************/
+
+
+/*******************************************************************************
+* Function Name: float32_t inline _pi_controller_step(PI_t *c, float32_t setpoint, float32_t measurement)
+
+* PI COntroller function
+*******************************************************************************/
+static inline float32_t _pi_controller_step(PI_t *c, float32_t setpoint, float32_t measurement)
+{
+	float32_t e = setpoint - measurement;
+	
+	float32_t u_unsat; 
+	
+	// Test
+	c->useIntFlag = true;
+	
+	if (c->useIntFlag) u_unsat = c->prevU + c->kp * (e - c->prevE + c->ki * c->Ts * e);
+	else u_unsat = c->prevU + c->kp * (e - c->prevE);
+	
+	float32_t u_sat = _sat(u_unsat, c->out_min, c->out_max);
+	
+	if (u_unsat - u_sat > 0.01 || u_unsat - u_sat < -0.01) c->useIntFlag = false;
+	else c->useIntFlag = true;
+	
+	return u_sat;
+}
+/******************************************************************************/
+
+
+/*******************************************************************************
+* Function Name: static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we)
+
+* Interrupt handler uses Hall signals to calculate the electical and machincal speed of the machine
+*******************************************************************************/
+static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we)
+{
+	const float32_t vq_boost = 1.0;
+	const float32_t we_ramp = 0.004; //[V/rad/s]
+	
+	*vd = 0.0;
+	*vq = vq_boost + we_ramp * we;
+}
+/******************************************************************************/
+
+/*******************************************************************************
 * Function Name: void speed_measurment_intr_handler(void)
 
 * Interrupt handler uses Hall signals to calculate the electical and machincal speed of the machine
@@ -631,7 +850,101 @@ void controller_counter_intr_handler()
 {
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Controller_Counter_HW, Controller_Counter_NUM);
 	
+	meas_si_t measurment_data = adc_meas;
+	float32_t ialpha, ibeta;
+	float32_t valpha_measured, vbeta_measured;
+	_clarke_ab(measurment_data.iu, measurment_data.iv, measurment_data.iw, &ialpha, &ibeta);
+	_clarke_ab(measurment_data.vu, measurment_data.vv, measurment_data.vw, &valpha_measured, &vbeta_measured);
+	_SMO_Update(&SMO, ialpha, ibeta, valpha_measured, vbeta_measured);
+	
+	PrintVars.we_OBS = _SMO_GetOmega(&SMO);
+	
+	static float32_t th = 0.0; // TODO: Theta muss von anderen Systemen kommen
+	static float32_t we = 0.0; // TODO: Omega_e muss von anderen Systemen kommen
+	static PI_t d;
+	static PI_t q;
+	
+	if (system_state == SYSTEM_OPEN_LOOP_START_FOC)
+	{
+		//TODO: Check with Infineon how to get interrupt Time.
+		const float32_t START_UP_TIME = 8.0;
+		const float32_t CALL_TIME = 1.0/25000.0;
+		we += we_startUp * CALL_TIME/START_UP_TIME;
+		th = _wrap_pi(th + CALL_TIME * we);
+	}
+	else if(system_state == SYSTEM_CLOSED_LOOP_FOC)
+	{
+		we = _SMO_GetOmega(&SMO);
+		th = _SMO_GetTheta(&SMO);
+	}
+	
+	//Only for testing Print vars
+	PrintVars.we = we;
+	
+	float32_t c = cosf(th);
+	float32_t s = sinf(th);
+	
+	float32_t id = 0.0, iq = 0.0;
+	_park_dq(ialpha, ibeta, s, c, &id, &iq);
+	
+	//Only for testing Print vars
+	PrintVars.id = id;
+	PrintVars.iq = iq;
+	
+	float32_t vd = 0.0, vq = 0.0;
+	if (system_state == SYSTEM_OPEN_LOOP_START_FOC)
+	{
+		if(we <= we_startUp) _open_loop_step(&vd, &vq, we);
+		else 
+		{
+			_open_loop_step(&vd, &vq, we);
+			system_state = SYSTEM_CLOSED_LOOP_FOC;
+			init_pi_d(&d, vd);
+			init_pi_q(&q, vq);
+		}
+	}
+	else if(system_state == SYSTEM_CLOSED_LOOP_FOC)
+	{
+		vd = _pi_controller_step(&d, 0.0, id);
+		vq = _pi_controller_step(&q, iq_ref, iq);
+	}
+	
+	//Only for testing Print vars
+	PrintVars.vd = vd;
+	PrintVars.vq = vq;
+	
+	float32_t valpha, vbeta;
+	_inv_park_ab(vd, vq, s, c, &valpha, &vbeta);
+	
+	float32_t va, vb, vc;
+	_inv_clarke_abc(valpha, vbeta, &va, &vb, &vc);
+	_svpwm(va, vb, vc, 0.0);
+	
 	Cy_TCPWM_ClearInterrupt(Controller_Counter_HW, Controller_Counter_NUM, intrStatus);
+}
+
+void init_pi_d(PI_t *d, float32_t vd)
+{
+	d->ki 			= 20.0;
+	d->kp			= 1.1;
+	d->out_max		= VDD/2.0;;
+	d->out_min		= -VDD/2.0;;
+	d->Ts			= CONTROLLER_INTERRUPT_TIME;
+	d->prevE		= 0.0;
+	d->prevU		= vd;
+	d->useIntFlag	= true;
+}
+
+void init_pi_q(PI_t *q, float32_t vq)
+{
+	q->ki 			= 20.0;
+	q->kp			= 1.1;
+	q->out_max		= VDD/2.0;
+	q->out_min		= 0.0;
+	q->Ts			= CONTROLLER_INTERRUPT_TIME;
+	q->prevE		= 0.0;
+	q->prevU		= vq;
+	q->useIntFlag	= true;
 }
 /******************************************************************************/
 
@@ -794,9 +1107,10 @@ static inline void _prealign_step_pwm(void)
 				NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
                 // Prealignment beendet:
                 preAlignment.st = INJ_IDLE;
-                //system_state =;
-
-                // Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
+                system_state = SYSTEM_OPEN_LOOP_START_FOC;
+                SMO_Init(&SMO);
+                NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
+                Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
             }
         } break;
     }
@@ -832,6 +1146,9 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 			if (adc_calibration.done)
             {
 				system_state = SYSTEM_READY;
+				// Only for Testing enable IRQ and setting system state here.
+				system_state = SYSTEM_PRE_ALIGNMENT;
+				NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
 				_prealign_start();
             }
 		}
@@ -866,7 +1183,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 
 * puts adc values in a frame
 *******************************************************************************/
-static inline adc_frame_t _adc_unpack_frame(const int16_t *data, const uint8_t *chan, uint8_t n)
+inline adc_frame_t _adc_unpack_frame(const int16_t *data, const uint8_t *chan, uint8_t n)
 {
     adc_frame_t f = {0};
 
@@ -896,7 +1213,7 @@ static inline adc_frame_t _adc_unpack_frame(const int16_t *data, const uint8_t *
 
 * frame to Amps and Volts
 *******************************************************************************/
-static inline bool _adc_frame_to_si(const adc_frame_t *f, meas_si_t *out)
+inline bool _adc_frame_to_si(const adc_frame_t *f, volatile meas_si_t *out)
 {
 	static const float32_t K_IU  = -0.0171f;
 	static const float32_t K_IV  = -0.0199f;
@@ -947,7 +1264,7 @@ void adc_calibration_start_lowside_clamp(uint32_t target_samples, uint32_t warmu
 
 *
 *******************************************************************************/
-static inline bool _cal_all_done(const adc_cal_ls_clamp_t *c)
+static inline bool _cal_all_done(adc_cal_ls_clamp_t *c)
 {
     return (c->cnt_iu  >= c->target) &&
            (c->cnt_iv  >= c->target) &&
@@ -1148,7 +1465,6 @@ void init()
 	if(result != Cy_TCPWM_Counter_Init(Controller_Counter_HW,Controller_Counter_NUM, &Controller_Counter_config)) { CY_ASSERT(0); }
     Cy_TCPWM_Counter_Enable(Controller_Counter_HW, Controller_Counter_NUM);
     Cy_SysInt_Init(&Controller_counter_intr_config, controller_counter_intr_handler);
-    NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
 
     /* PWM U/V/W init */
 	if (result != Cy_TCPWM_PWM_Init(PWM_Counter_U_HW, PWM_Counter_U_NUM, &PWM_Counter_U_config)) { CY_ASSERT(0); }
@@ -1204,33 +1520,23 @@ int main(void)
 		if (Cy_GPIO_Read(SW2_PORT, SW2_NUM) == 1UL && button_pressed_before == false)
 		{
 			button_pressed_before = true;
-	        switch (system_state)
-	        {
-	            case SYSTEM_READY:
-	            	system_state = SYSTEM_PRE_ALIGNMENT;
-					NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
-	                break;
-	            
-	            // only for testing
-	            case SYSTEM_PRE_ALIGNMENT:
-					_prealign_start();
-	            	NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
-	            	break;
-
-	
-	            default:
-	                break;
-	        }
+			
+			if (iq_ref >= 1.5) iq_ref = 0.25;
+			else iq_ref = 5.0;
 		}
 		else if (Cy_GPIO_Read(SW2_PORT, SW2_NUM) == 0UL)
 		{
 			button_pressed_before = false;
 		}
 		
-		if (preAlignment.theta_e_rad_final_ready)
-		{
-		    preAlignment.theta_e_rad_final_ready = false;
-		    printf("theta_e = %.3f rad\r\n", preAlignment.theta_e_rad_final);
+		/* UART */
+        char print_Array[25];
+        float32_t data_Array[6] = {PrintVars.id, PrintVars.iq, PrintVars.vd, PrintVars.vq, PrintVars.we, PrintVars.we_OBS};
+        print_Array[0] = 0xAA;
+        memcpy(&print_Array[1], data_Array, sizeof(data_Array));
+        for (int i = 0; i < (int)sizeof(print_Array); i++) 
+        { 
+			printf("%c", print_Array[i]); 
 		}
     }
 }
