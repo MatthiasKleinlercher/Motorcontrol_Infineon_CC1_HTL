@@ -160,8 +160,8 @@ typedef struct
     float32_t theta_est_rad;    // Result (rad)
     bool theta_polar_is_north;
     
-    float32_t theta_e_rad_final;
-    bool theta_e_rad_final_ready;
+    volatile float32_t theta_e_rad_final;
+    volatile bool theta_e_rad_final_ready;
 
 } prealign_t;
 
@@ -217,6 +217,30 @@ typedef struct
     bool useIntFlag;
 } PI_t;
 
+// Hall measurmente
+typedef struct
+{
+    volatile uint8_t   lut_idx;        // 0..5
+    volatile uint8_t   prev_lut_idx;	  // 0..5
+    volatile int8_t    direction;      // +1 = math. pos / -1 = math. negative / 0
+    
+    volatile uint32_t  prev_Count;
+    volatile bool	   overflow;
+	
+	volatile bool	   correct_angle_set;
+	volatile float32_t correct_theta;
+	
+	volatile float32_t we_hall;
+} hall_meas_t;
+
+enum {
+    HALL_FAULT_NONE          = 0,
+    HALL_FAULT_INVALID_STATE = 1u << 0,
+    HALL_FAULT_INVALID_TRANS = 1u << 1,
+    HALL_FAULT_GLITCH        = 1u << 2,
+    HALL_FAULT_TIMEOUT       = 1u << 3,
+};
+
 // Params for pre alignment
 #define M_COARSE              (0.1f)
 #define M_FINE                (0.1f)
@@ -239,6 +263,9 @@ typedef struct
 #define ONE_o_SQRT3     0.5773502692f
 #define ONE_o_THREE     0.3333333333f
 
+// system frequenzy
+#define SysFreq 240000000
+
 // Block defines
 // LUT_SIZE for Block
 #define LUT_SIZE 6
@@ -257,6 +284,9 @@ typedef struct
 // Startup frequenzy
 #define we_startUp 800.0
 
+// Shutdown frequenzy
+#define we_shutDown 400.0
+
 //Controller Interrupt Time
 #define CONTROLLER_INTERRUPT_TIME 0.00004
 
@@ -268,10 +298,14 @@ typedef struct
 {
 	float32_t we;
 	float32_t we_OBS;
+	float32_t we_hall;
 	float32_t id;
 	float32_t iq;
 	float32_t vd;
 	float32_t vq;
+	float32_t iq_ref;
+	float32_t we_ref;
+	float32_t k;
 }Print_t;
 /*******************************************************************************
 * Macros
@@ -284,23 +318,25 @@ typedef struct
 
 // Finite State Machine
 typedef enum {SYSTEM_OFF, SYSTEM_INIT, SYSTEM_CALIBRATION, SYSTEM_READY, SYSTEM_PRE_ALIGNMENT, SYSTEM_OPEN_LOOP_START_FOC, SYSTEM_CLOSED_LOOP_FOC} system_state_t;
+// SYSTEM_CLOSED_LOOP_SENSORED_FOC, SYSTEM_CLOSED_LOOP_SENSORLESS_FOC, SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN, SYSTEM_OPEN_LOOP_FOC_SHUTDOWN
 volatile system_state_t system_state = SYSTEM_OFF;
 
 // Interruptconfig
 cy_stc_sysint_t Controller_counter_intr_config = { .intrSrc = Controller_Counter_IRQ, .intrPriority = 4U };
 cy_stc_sysint_t Speed_Measurment_intr_config   = { .intrSrc = Speed_Measurment_Counter_IRQ, .intrPriority = 5U };
-cy_stc_sysint_t hall_isr3_config                = { .intrSrc = ioss_interrupts_sec_gpio_8_IRQn, .intrPriority = 2U };
-cy_stc_sysint_t hall_isr12_config                = { .intrSrc = ioss_interrupts_sec_gpio_9_IRQn, .intrPriority = 2U };
+cy_stc_sysint_t hall_isr3_config               = { .intrSrc = ioss_interrupts_sec_gpio_8_IRQn, .intrPriority = 2U };
+cy_stc_sysint_t hall_isr12_config              = { .intrSrc = ioss_interrupts_sec_gpio_9_IRQn, .intrPriority = 2U };
 cy_stc_sysint_t fifo_isr_cfg             	   = { .intrSrc = pass_interrupt_fifos_IRQn, .intrPriority = 3U };
 cy_stc_sysint_t set_value_intr_config          = { .intrSrc = Test_Counter_IRQ, .intrPriority = 1U };
 cy_stc_sysint_t pwm_reload_intr_config         = { .intrSrc = PWM_Counter_U_IRQ, .intrPriority =6U};
+cy_stc_sysint_t Safety_intr_config			   = { .intrSrc = Safety_Counter_IRQ, .intrPriority = 7U};
 
 // DEBUG_UART
 static cy_stc_scb_uart_context_t DEBUG_UART_context;
 static mtb_hal_uart_t DEBUG_UART_hal_obj;
 
 // ADC - Calibration
-volatile adc_cal_ls_clamp_t adc_calibration;
+adc_cal_ls_clamp_t adc_calibration;
 
 // ADC - meas values with voltage and current data
 volatile  meas_si_t adc_meas;
@@ -311,14 +347,17 @@ volatile ab_t invClarkeVoltage;
 volatile dq_t invParkVoltage;
 
 // prealignment
-volatile prealign_t preAlignment;
+prealign_t preAlignment;
 volatile bool inj_collect_now = false;     // gets true in ON
 volatile float32_t inj_theta_now = 0.0f;
 volatile float32_t last_imag = 0.0f;       // ADC-ISR writes values in Peak
 
+// Hall measurement
+static hall_meas_t hall_values = {};
+
 // Test Vars
 volatile Print_t PrintVars;
-volatile float32_t iq_ref = 1.0;
+float32_t we_ref = 800.0;
 /*******************************************************************************
 * Functions
 *******************************************************************************/
@@ -362,7 +401,10 @@ static inline float32_t _SMO_GetSpeed(const smo_t* smo);
 static inline float32_t _pi_controller_step(PI_t *c, float32_t setpoint, float32_t measurement);
 void init_pi_d(PI_t *d, float32_t vd);
 void init_pi_q(PI_t *q, float32_t vq);
+void init_pi_speed(PI_t *s);
 static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we);
+void Poti_read(void);
+void safety_intr_handler();
 				 
 
 /*******************************************************************************
@@ -490,11 +532,9 @@ static inline void _svpwm(float32_t Va, float32_t Vb, float32_t Vc, float32_t ov
 		Va *= scale; Vb *= scale; Vc *= scale;
 	}
 	
-	float32_t Vdc = adc_meas.vdc;
-	
-	float32_t da = _sat(0.5f + Va / Vdc, 0.0f, 1.0f);
-	float32_t db = _sat(0.5f + Vb / Vdc, 0.0f, 1.0f);
-	float32_t dc = _sat(0.5f + Vc / Vdc, 0.0f, 1.0f);
+	float32_t da = _sat(0.5f + Va / VDD, 0.0f, 1.0f);
+	float32_t db = _sat(0.5f + Vb / VDD, 0.0f, 1.0f);
+	float32_t dc = _sat(0.5f + Vc / VDD, 0.0f, 1.0f);
 	
 	uint32_t PWM_Period = Cy_TCPWM_PWM_GetPeriod0(PWM_Counter_U_HW, PWM_Counter_U_NUM);
 	
@@ -703,7 +743,25 @@ void speed_measurment_intr_handler()
 {
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
 	
+	hall_values.overflow = true;
+	
 	Cy_TCPWM_ClearInterrupt(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM, intrStatus);
+}
+/******************************************************************************/
+
+/*******************************************************************************
+* Function Name: void safety_intr_handler()
+
+* Interrupt handler to turn off the machine
+*******************************************************************************/
+void safety_intr_handler()
+{
+	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Safety_Counter_HW, Safety_Counter_NUM);
+	
+	//system_state = SYSTEM_OFF;
+	//low_sides_all_on();
+	
+	Cy_TCPWM_ClearInterrupt(Safety_Counter_HW, Safety_Counter_NUM, intrStatus);
 }
 /******************************************************************************/
 
@@ -800,6 +858,113 @@ static inline float32_t _SMO_GetSpeed(const smo_t* smo){ return smo->omega_hat/(
 
 
 /*******************************************************************************
+* Function Name: 
+
+				 
+* 
+*******************************************************************************/
+
+const uint8_t hall_to_lut[8] =
+{
+    255, // 000
+    5,   // 001
+    3,   // 010
+    4,   // 011
+    1,   // 100
+    0,   // 101
+    2,   // 110
+    255  // 111
+};
+
+const float32_t lut_to_theta[6] = 
+{
+	0.26179939,
+	1.57079633,
+	2.87979327,
+	-2.87979327,
+	-1.57079633,
+	-0.26179939
+};
+
+uint8_t read_hall_state(void)
+{
+    uint8_t H1 = Cy_GPIO_Read(HALL1_PORT, HALL1_PIN);
+    uint8_t H2 = Cy_GPIO_Read(HALL2_PORT, HALL2_PIN);
+    uint8_t H3 = Cy_GPIO_Read(HALL3_PORT, HALL3_PIN);
+    return (H1 << 2) | (H2 << 1) | H3;
+}
+
+inline int8_t _get_direction(uint8_t lut_idx, uint8_t prev_lut_idx)
+{
+	if 		((int8_t)lut_idx - (int8_t)prev_lut_idx == 1 || (int8_t)lut_idx - (int8_t)prev_lut_idx == -5) return 1;
+	else if ((int8_t)lut_idx - (int8_t)prev_lut_idx == -1 || (int8_t)lut_idx - (int8_t)prev_lut_idx == 5) return -1;
+	else return 0;
+}
+
+inline float32_t _get_correct_theta(uint8_t lut_idx, uint8_t prev_lut_idx)
+{
+	if ((lut_idx == 1 && prev_lut_idx == 0) || (lut_idx == 0 && prev_lut_idx == 1)) return lut_to_theta[0];
+	else if ((lut_idx == 2 && prev_lut_idx == 1) || (lut_idx == 1 && prev_lut_idx == 2)) return lut_to_theta[1];
+	else if ((lut_idx == 3 && prev_lut_idx == 2) || (lut_idx == 2 && prev_lut_idx == 3)) return lut_to_theta[2];
+	else if ((lut_idx == 4 && prev_lut_idx == 3) || (lut_idx == 3 && prev_lut_idx == 4)) return lut_to_theta[3];
+	else if ((lut_idx == 5 && prev_lut_idx == 4) || (lut_idx == 4 && prev_lut_idx == 5)) return lut_to_theta[4];
+	else if ((lut_idx == 0 && prev_lut_idx == 5) || (lut_idx == 5 && prev_lut_idx == 0)) return lut_to_theta[5];
+	else return 0.0;
+}
+
+
+void hall_interrupt_handler(void)
+{
+	
+	uint8_t lut_index = hall_to_lut[read_hall_state()];
+	
+	hall_values.lut_idx = lut_index;
+	//hall_values.direction = _get_direction(lut_index, hall_values.prev_lut_idx);
+	//hall_values.correct_theta = _get_correct_theta(lut_index, hall_values.prev_lut_idx);
+	
+	if (hall_values.correct_theta != 0.0) hall_values.correct_angle_set = true;
+	else hall_values.correct_theta = false;
+	
+	hall_values.prev_lut_idx = lut_index;
+	
+	if (Cy_TCPWM_Counter_GetStatus(Safety_Counter_HW, Safety_Counter_NUM) & CY_TCPWM_COUNTER_STATUS_COUNTER_RUNNING)
+	{
+		Cy_TCPWM_TriggerStopOrKill_Single(Safety_Counter_HW, Safety_Counter_NUM);
+		Cy_TCPWM_Counter_SetCounter(Safety_Counter_HW, Safety_Counter_NUM, 0U);
+	}
+	Cy_TCPWM_TriggerStart_Single(Safety_Counter_HW, Safety_Counter_NUM);
+	
+	if (Cy_TCPWM_Counter_GetStatus(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM) & CY_TCPWM_COUNTER_STATUS_COUNTER_RUNNING)
+	{
+		uint32_t count = Cy_TCPWM_Counter_GetCounter(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
+		if (hall_values.overflow == false)
+		{
+			if (count > hall_values.prev_Count)
+			{
+				uint32_t diff_count = count - hall_values.prev_Count;
+				float32_t timePerHall = (float32_t)diff_count/(float32_t)SysFreq;
+				hall_values.we_hall = TWO_PI/(timePerHall * (float32_t)LUT_SIZE);
+			}
+			hall_values.prev_Count = count;
+		}
+		else 
+		{
+			hall_values.prev_Count = count;
+			hall_values.overflow = false;	
+		}
+	}
+	else Cy_TCPWM_TriggerStart_Single(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
+	
+    Cy_GPIO_ClearInterrupt(HALL1_PORT, HALL1_PIN);
+    Cy_GPIO_ClearInterrupt(HALL2_PORT, HALL2_PIN);
+    Cy_GPIO_ClearInterrupt(HALL3_PORT, HALL3_PIN);
+}
+
+static inline float32_t _HALL_get_we(hall_meas_t* hall) {return hall->we_hall;}
+/******************************************************************************/
+
+
+/*******************************************************************************
 * Function Name: float32_t inline _pi_controller_step(PI_t *c, float32_t setpoint, float32_t measurement)
 
 * PI COntroller function
@@ -809,17 +974,18 @@ static inline float32_t _pi_controller_step(PI_t *c, float32_t setpoint, float32
 	float32_t e = setpoint - measurement;
 	
 	float32_t u_unsat; 
-	
-	// Test
-	c->useIntFlag = true;
-	
+
 	if (c->useIntFlag) u_unsat = c->prevU + c->kp * (e - c->prevE + c->ki * c->Ts * e);
-	else u_unsat = c->prevU + c->kp * (e - c->prevE);
+	//else u_unsat = c->prevU + c->kp * (e - c->prevE);
+	else u_unsat = c->kp * e;
 	
 	float32_t u_sat = _sat(u_unsat, c->out_min, c->out_max);
 	
 	if (u_unsat - u_sat > 0.01 || u_unsat - u_sat < -0.01) c->useIntFlag = false;
 	else c->useIntFlag = true;
+
+	c->prevE = e;
+	c->prevU = u_sat;
 	
 	return u_sat;
 }
@@ -850,6 +1016,8 @@ void controller_counter_intr_handler()
 {
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Controller_Counter_HW, Controller_Counter_NUM);
 	
+	Cy_GPIO_Inv(FAN_PWM_PORT, FAN_PWM_PIN);
+	
 	meas_si_t measurment_data = adc_meas;
 	float32_t ialpha, ibeta;
 	float32_t valpha_measured, vbeta_measured;
@@ -857,26 +1025,42 @@ void controller_counter_intr_handler()
 	_clarke_ab(measurment_data.vu, measurment_data.vv, measurment_data.vw, &valpha_measured, &vbeta_measured);
 	_SMO_Update(&SMO, ialpha, ibeta, valpha_measured, vbeta_measured);
 	
+	// Test
 	PrintVars.we_OBS = _SMO_GetOmega(&SMO);
+	PrintVars.we_hall = _HALL_get_we(&hall_values);
 	
 	static float32_t th = 0.0; // TODO: Theta muss von anderen Systemen kommen
 	static float32_t we = 0.0; // TODO: Omega_e muss von anderen Systemen kommen
 	static PI_t d;
 	static PI_t q;
+	static PI_t speed;
 	
 	if (system_state == SYSTEM_OPEN_LOOP_START_FOC)
 	{
 		//TODO: Check with Infineon how to get interrupt Time.
-		const float32_t START_UP_TIME = 8.0;
+		const float32_t START_UP_TIME = 3.0;
 		const float32_t CALL_TIME = 1.0/25000.0;
 		we += we_startUp * CALL_TIME/START_UP_TIME;
 		th = _wrap_pi(th + CALL_TIME * we);
 	}
-	else if(system_state == SYSTEM_CLOSED_LOOP_FOC)
+	else if(system_state == SYSTEM_CLOSED_LOOP_FOC /*|| system_state == SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN*/)
 	{
 		we = _SMO_GetOmega(&SMO);
 		th = _SMO_GetTheta(&SMO);
 	}
+	/*else if(system_state == SYSTEM_OPEN_LOOP_FOC_SHUTDOWN)
+	{
+		//TODO: Check with Infineon how to get interrupt Time.
+		const float32_t SHUT_DOWN_TIME = 8.0;
+		const float32_t CALL_TIME = 1.0/25000.0;
+		we -= we_shutDown * CALL_TIME/SHUT_DOWN_TIME;
+		if (we <= 5.0) 
+		{
+			we = 0.0;
+			system_state = SYSTEM_OFF;
+		}
+		th = _wrap_pi(th + CALL_TIME * we);
+	}*/
 	
 	//Only for testing Print vars
 	PrintVars.we = we;
@@ -901,10 +1085,29 @@ void controller_counter_intr_handler()
 			system_state = SYSTEM_CLOSED_LOOP_FOC;
 			init_pi_d(&d, vd);
 			init_pi_q(&q, vq);
+			init_pi_speed(&speed);
 		}
 	}
-	else if(system_state == SYSTEM_CLOSED_LOOP_FOC)
+	else if(system_state == SYSTEM_CLOSED_LOOP_FOC /*|| system_state == SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN*/)
 	{
+		static float32_t iq_ref = 0.0;
+		static uint8_t count = 10;
+		if (count >= 9)
+		{
+			/*
+			if (system_state == SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN) 
+			{
+				we_ref = 400.0;
+				if (we < 450.0) system_state = SYSTEM_OPEN_LOOP_FOC_SHUTDOWN;
+			}*/
+			PrintVars.we_ref = we_ref;
+			
+			iq_ref = _pi_controller_step(&speed, we_ref, we);
+			PrintVars.iq_ref = iq_ref;
+			count = 0;
+		}
+		else count++;
+		
 		vd = _pi_controller_step(&d, 0.0, id);
 		vq = _pi_controller_step(&q, iq_ref, iq);
 	}
@@ -918,15 +1121,15 @@ void controller_counter_intr_handler()
 	
 	float32_t va, vb, vc;
 	_inv_clarke_abc(valpha, vbeta, &va, &vb, &vc);
-	_svpwm(va, vb, vc, 0.0);
+	_svpwm(va, vb, vc, 0.5);
 	
 	Cy_TCPWM_ClearInterrupt(Controller_Counter_HW, Controller_Counter_NUM, intrStatus);
 }
 
 void init_pi_d(PI_t *d, float32_t vd)
 {
-	d->ki 			= 20.0;
-	d->kp			= 1.1;
+	d->ki 			= 219.9;
+	d->kp			= 0.54;
 	d->out_max		= VDD/2.0;;
 	d->out_min		= -VDD/2.0;;
 	d->Ts			= CONTROLLER_INTERRUPT_TIME;
@@ -937,14 +1140,26 @@ void init_pi_d(PI_t *d, float32_t vd)
 
 void init_pi_q(PI_t *q, float32_t vq)
 {
-	q->ki 			= 20.0;
-	q->kp			= 1.1;
+	q->ki 			= 219.9;
+	q->kp			= 0.54;
 	q->out_max		= VDD/2.0;
 	q->out_min		= 0.0;
 	q->Ts			= CONTROLLER_INTERRUPT_TIME;
 	q->prevE		= 0.0;
 	q->prevU		= vq;
 	q->useIntFlag	= true;
+}
+
+void init_pi_speed(PI_t *s)
+{
+	s->ki 			= 2.7;
+	s->kp			= 0.1;
+	s->out_max		= 10.0;
+	s->out_min		= 0.001;
+	s->Ts			= CONTROLLER_INTERRUPT_TIME*10.0;
+	s->prevE		= 0.0;
+	s->prevU		= 0.0;
+	s->useIntFlag	= true;
 }
 /******************************************************************************/
 
@@ -1132,6 +1347,9 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 	
 	if (intrStatus & CY_HPPASS_INTR_FIFO_0_LEVEL)
     {
+		// Test:
+		Poti_read();
+		
         /* reads all the voltage and current data */
         uint8_t count = Cy_HPPASS_FIFO_ReadAll(ADC_FIFO_IDX, adc_data, adc_chan);
 		
@@ -1155,7 +1373,14 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 		else
         {
             adc_frame_t frame = _adc_unpack_frame(adc_data, adc_chan, count);
-            _adc_frame_to_si(&frame, &adc_meas);
+            
+            meas_si_t tmp;
+            if (_adc_frame_to_si(&frame, &tmp))
+			{
+			    adc_meas = tmp;     
+			    adc_meas_valid = true;
+			}
+			else adc_meas_valid = false;
         }
         
         if (system_state == SYSTEM_PRE_ALIGNMENT && inj_collect_now)
@@ -1174,6 +1399,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 		
         Cy_HPPASS_FIFO_ClearInterrupt(CY_HPPASS_INTR_FIFO_0_LEVEL);
     }
+    
 	Cy_HPPASS_FIFO_ClearInterrupt(intrStatus);
 }
 /******************************************************************************/
@@ -1424,7 +1650,14 @@ void calibration_init()
 }
 /******************************************************************************/
 
-
+void Poti_read(void)
+{
+    int32_t raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(12U);
+    we_ref = (float32_t)raw_value_idPot / 4095.0f * 6400.0;
+    
+    raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(10U);
+    PrintVars.k = (float32_t)raw_value_idPot / 4095.0f * 3.0;
+}
 
 /*******************************************************************************
 * Function Name: void init(void)
@@ -1460,6 +1693,12 @@ void init()
     Cy_TCPWM_Counter_Enable(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
     Cy_SysInt_Init(&Speed_Measurment_intr_config, speed_measurment_intr_handler);
     NVIC_EnableIRQ(Speed_Measurment_intr_config.intrSrc);
+    
+    /* Safety Counter turns off the machine if something goes wrong */
+   	if(result != Cy_TCPWM_Counter_Init(Safety_Counter_HW,Safety_Counter_NUM, &Safety_Counter_config)) { CY_ASSERT(0); }
+    Cy_TCPWM_Counter_Enable(Safety_Counter_HW, Safety_Counter_NUM);
+    Cy_SysInt_Init(&Safety_intr_config, safety_intr_handler);
+    //NVIC_EnableIRQ(Safety_intr_config.intrSrc);
 
     /* Controller Counter init, used for PI Controller */
 	if(result != Cy_TCPWM_Counter_Init(Controller_Counter_HW,Controller_Counter_NUM, &Controller_Counter_config)) { CY_ASSERT(0); }
@@ -1485,6 +1724,14 @@ void init()
     Cy_GPIO_Pin_Init(HALL1_PORT, HALL1_PIN, &HALL1_config);
     Cy_GPIO_Pin_Init(HALL2_PORT, HALL2_PIN, &HALL2_config);
     Cy_GPIO_Pin_Init(HALL3_PORT, HALL3_PIN, &HALL3_config);
+    Cy_SysInt_Init(&hall_isr12_config, hall_interrupt_handler);
+    Cy_SysInt_Init(&hall_isr3_config, hall_interrupt_handler);
+    NVIC_EnableIRQ(hall_isr12_config.intrSrc);
+    NVIC_EnableIRQ(hall_isr3_config.intrSrc);
+    
+    /* Fan PWM Pin*/
+    Cy_GPIO_Pin_Init(FAN_PWM_PORT, FAN_PWM_PIN, &FAN_PWM_config);
+    
     Cy_GPIO_Pin_Init(SW1_PORT, SW1_NUM, &SW1_config);
     Cy_GPIO_Pin_Init(SW2_PORT, SW2_NUM, &SW2_config);
 
@@ -1521,8 +1768,9 @@ int main(void)
 		{
 			button_pressed_before = true;
 			
-			if (iq_ref >= 1.5) iq_ref = 0.25;
-			else iq_ref = 5.0;
+			if (system_state == SYSTEM_OFF) system_state = SYSTEM_CALIBRATION;
+			
+			
 		}
 		else if (Cy_GPIO_Read(SW2_PORT, SW2_NUM) == 0UL)
 		{
@@ -1530,8 +1778,8 @@ int main(void)
 		}
 		
 		/* UART */
-        char print_Array[25];
-        float32_t data_Array[6] = {PrintVars.id, PrintVars.iq, PrintVars.vd, PrintVars.vq, PrintVars.we, PrintVars.we_OBS};
+        char print_Array[33];
+        float32_t data_Array[8] = {PrintVars.id, PrintVars.iq, PrintVars.iq_ref, PrintVars.vd, PrintVars.vq, PrintVars.we, PrintVars.we_ref, PrintVars.we_hall};
         print_Array[0] = 0xAA;
         memcpy(&print_Array[1], data_Array, sizeof(data_Array));
         for (int i = 0; i < (int)sizeof(print_Array); i++) 
@@ -1540,6 +1788,7 @@ int main(void)
 		}
     }
 }
+
 
 
 /* [] END OF FILE */
