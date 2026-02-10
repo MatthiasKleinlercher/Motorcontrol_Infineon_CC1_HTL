@@ -296,16 +296,15 @@ enum {
 // print global vars
 typedef struct
 {
+	float32_t ea;
+	float32_t eb;
+	float32_t eaf;
+	float32_t ebf;
+	float32_t wHat;
+	float32_t WHatf;
 	float32_t we;
-	float32_t we_OBS;
 	float32_t we_hall;
-	float32_t id;
-	float32_t iq;
-	float32_t vd;
-	float32_t vq;
-	float32_t iq_ref;
-	float32_t we_ref;
-	float32_t k;
+	float32_t a;
 }Print_t;
 /*******************************************************************************
 * Macros
@@ -317,7 +316,7 @@ typedef struct
 *******************************************************************************/
 
 // Finite State Machine
-typedef enum {SYSTEM_OFF, SYSTEM_INIT, SYSTEM_CALIBRATION, SYSTEM_READY, SYSTEM_PRE_ALIGNMENT, SYSTEM_OPEN_LOOP_START_FOC, SYSTEM_CLOSED_LOOP_FOC} system_state_t;
+typedef enum {SYSTEM_OFF, SYSTEM_INIT, SYSTEM_CALIBRATION, SYSTEM_READY, SYSTEM_STARTUP_FOC_PREALIGN, SYSTEM_STARTUP_FOC_OPENLOOP, SYSTEM_RUN_FOC, SYSTEM_STARTUP_BLOCK, SYSTEM_RUN_BLOCK, SYSTEM_SHUTDOWN, SYSTEM_FAULT} system_state_t;
 // SYSTEM_CLOSED_LOOP_SENSORED_FOC, SYSTEM_CLOSED_LOOP_SENSORLESS_FOC, SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN, SYSTEM_OPEN_LOOP_FOC_SHUTDOWN
 volatile system_state_t system_state = SYSTEM_OFF;
 
@@ -781,7 +780,7 @@ void SMO_Init(smo_t *smo)
     smo->L = 0.000086;
     smo->Ts = CONTROLLER_INTERRUPT_TIME;
     smo->fs = 1.0/CONTROLLER_INTERRUPT_TIME;
-    smo->p  = 4.0;
+    smo->p  = 1.0;
     
     smo->ealpha_f = 0.0f;  smo->ebeta_f = 0.0f;
     smo->i_alpha_prev = 0.0f;  smo->i_beta_prev = 0.0f;
@@ -792,7 +791,7 @@ void SMO_Init(smo_t *smo)
     smo->omega_hat = 0.0f;
     smo->integ_e   = 0.0f;
 
-    // Faustregler (für Start): Kp ~ 2*w_pll, Ki ~ (w_pll)^2; w_pll << w0_emf
+    //Kp ~ 2*w_pll, Ki ~ (w_pll)^2; w_pll << w0_emf
     const float w_pll = 2.0f * 3.14159265f * 15.0f;   // 15 Hz
     smo->Kp_pll = 1.4f * w_pll;
     smo->Ki_pll = (w_pll*w_pll);
@@ -806,9 +805,7 @@ void SMO_Init(smo_t *smo)
     smo->theta_rad = 0.0;
     smo->w_rad_s = 0.0f;
     
-    // optionale ω-Glättung
-    const float w_omega = 2.0f * 3.14159265f * 20.0f; // 20 Hz
-    smo->alpha_omega = 1.0f - expf(-w_omega * smo->Ts);
+    smo->alpha_omega = 0.3;
     
     smo->omega_hat_f = 0.0f;
     
@@ -824,17 +821,27 @@ static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, fl
     float32_t e_alpha = vAlpha - (smo->R * iAlpha) - (smo->L * di_alpha);
     float32_t e_beta  = vBeta  - (smo->R * iBeta)  - (smo->L * di_beta);
 	
+	// Test: 
+	PrintVars.ea = e_alpha;
+	PrintVars.eb = e_beta;
+	
 	const float32_t a = smo->alpha_emf;
     smo->ealpha_f += a * (e_alpha - smo->ealpha_f);
     smo->ebeta_f  += a * (e_beta  - smo->ebeta_f);
 	
+	// Tests:
+	PrintVars.eaf = smo->ealpha_f;
+	PrintVars.ebf = smo->ebeta_f;
+	
 	float32_t e_theta = -((smo->ebeta_f * sinf(smo->theta_hat)) + (smo->ealpha_f * cosf(smo->theta_hat)));
 	
 	// PLL mit einfachem Antiwindup
-    const float OMEGA_MAX = 6720.0f;
+    const float32_t OMEGA_MAX = 6720.0f;
     float32_t omega_u = smo->Kp_pll * e_theta + smo->integ_e;
     float32_t omega_limited = fminf(fmaxf(omega_u, -OMEGA_MAX), OMEGA_MAX);
     smo->omega_hat = omega_limited;
+    // Test:
+    PrintVars.wHat = omega_limited;
     
     // Back-calculation (k_aw ≈ ω_n)
     const float k_aw = 2.0f * 3.14159265f * 15.0f;
@@ -845,7 +852,9 @@ static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, fl
 
     // w-Glättung (für Anzeige)
     smo->omega_hat_f += smo->alpha_omega * (smo->omega_hat - smo->omega_hat_f);
-
+	// Test:
+	PrintVars.WHatf = smo->omega_hat_f;
+	
     smo->i_alpha_prev = iAlpha;
     smo->i_beta_prev  = iBeta;
 }
@@ -853,7 +862,7 @@ static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, fl
 
 static inline float32_t _SMO_GetTheta(const smo_t* smo){ return smo->theta_rad; }
 static inline float32_t _SMO_GetOmega(const smo_t* smo){ return smo->omega_hat; }
-static inline float32_t _SMO_GetSpeed(const smo_t* smo){ return smo->omega_hat/(TWO_PI*smo->p*smo->p)*60;}
+static inline float32_t _SMO_GetSpeed(const smo_t* smo){ return (smo->omega_hat / (TWO_PI * smo->p)) * 60.0f;}
 /******************************************************************************/
 
 
@@ -1000,7 +1009,7 @@ static inline float32_t _pi_controller_step(PI_t *c, float32_t setpoint, float32
 static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we)
 {
 	const float32_t vq_boost = 1.0;
-	const float32_t we_ramp = 0.004; //[V/rad/s]
+	const float32_t we_ramp = 0.002; //[V/rad/s]
 	
 	*vd = 0.0;
 	*vq = vq_boost + we_ramp * we;
@@ -1016,8 +1025,6 @@ void controller_counter_intr_handler()
 {
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Controller_Counter_HW, Controller_Counter_NUM);
 	
-	Cy_GPIO_Inv(FAN_PWM_PORT, FAN_PWM_PIN);
-	
 	meas_si_t measurment_data = adc_meas;
 	float32_t ialpha, ibeta;
 	float32_t valpha_measured, vbeta_measured;
@@ -1026,8 +1033,8 @@ void controller_counter_intr_handler()
 	_SMO_Update(&SMO, ialpha, ibeta, valpha_measured, vbeta_measured);
 	
 	// Test
-	PrintVars.we_OBS = _SMO_GetOmega(&SMO);
 	PrintVars.we_hall = _HALL_get_we(&hall_values);
+	PrintVars.we =  _SMO_GetOmega(&SMO);
 	
 	static float32_t th = 0.0; // TODO: Theta muss von anderen Systemen kommen
 	static float32_t we = 0.0; // TODO: Omega_e muss von anderen Systemen kommen
@@ -1035,7 +1042,7 @@ void controller_counter_intr_handler()
 	static PI_t q;
 	static PI_t speed;
 	
-	if (system_state == SYSTEM_OPEN_LOOP_START_FOC)
+	if (system_state == SYSTEM_STARTUP_FOC_OPENLOOP)
 	{
 		//TODO: Check with Infineon how to get interrupt Time.
 		const float32_t START_UP_TIME = 3.0;
@@ -1043,7 +1050,7 @@ void controller_counter_intr_handler()
 		we += we_startUp * CALL_TIME/START_UP_TIME;
 		th = _wrap_pi(th + CALL_TIME * we);
 	}
-	else if(system_state == SYSTEM_CLOSED_LOOP_FOC /*|| system_state == SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN*/)
+	else if(system_state == SYSTEM_RUN_FOC)
 	{
 		we = _SMO_GetOmega(&SMO);
 		th = _SMO_GetTheta(&SMO);
@@ -1071,39 +1078,26 @@ void controller_counter_intr_handler()
 	float32_t id = 0.0, iq = 0.0;
 	_park_dq(ialpha, ibeta, s, c, &id, &iq);
 	
-	//Only for testing Print vars
-	PrintVars.id = id;
-	PrintVars.iq = iq;
-	
 	float32_t vd = 0.0, vq = 0.0;
-	if (system_state == SYSTEM_OPEN_LOOP_START_FOC)
+	if (system_state == SYSTEM_STARTUP_FOC_OPENLOOP)
 	{
 		if(we <= we_startUp) _open_loop_step(&vd, &vq, we);
 		else 
 		{
 			_open_loop_step(&vd, &vq, we);
-			system_state = SYSTEM_CLOSED_LOOP_FOC;
+			system_state = SYSTEM_RUN_FOC;
 			init_pi_d(&d, vd);
 			init_pi_q(&q, vq);
 			init_pi_speed(&speed);
 		}
 	}
-	else if(system_state == SYSTEM_CLOSED_LOOP_FOC /*|| system_state == SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN*/)
+	else if(system_state == SYSTEM_RUN_FOC)
 	{
 		static float32_t iq_ref = 0.0;
 		static uint8_t count = 10;
 		if (count >= 9)
 		{
-			/*
-			if (system_state == SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN) 
-			{
-				we_ref = 400.0;
-				if (we < 450.0) system_state = SYSTEM_OPEN_LOOP_FOC_SHUTDOWN;
-			}*/
-			PrintVars.we_ref = we_ref;
-			
 			iq_ref = _pi_controller_step(&speed, we_ref, we);
-			PrintVars.iq_ref = iq_ref;
 			count = 0;
 		}
 		else count++;
@@ -1111,10 +1105,6 @@ void controller_counter_intr_handler()
 		vd = _pi_controller_step(&d, 0.0, id);
 		vq = _pi_controller_step(&q, iq_ref, iq);
 	}
-	
-	//Only for testing Print vars
-	PrintVars.vd = vd;
-	PrintVars.vq = vq;
 	
 	float32_t valpha, vbeta;
 	_inv_park_ab(vd, vq, s, c, &valpha, &vbeta);
@@ -1173,7 +1163,7 @@ void pwm_reload_intr_handler()
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(PWM_Counter_U_HW, PWM_Counter_U_NUM);
 	if (intrStatus & CY_TCPWM_INT_ON_TC)
     {
-        if (system_state == SYSTEM_PRE_ALIGNMENT)
+        if (system_state == SYSTEM_STARTUP_FOC_PREALIGN)
         {
             _prealign_step_pwm();
         }
@@ -1322,7 +1312,7 @@ static inline void _prealign_step_pwm(void)
 				NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
                 // Prealignment beendet:
                 preAlignment.st = INJ_IDLE;
-                system_state = SYSTEM_OPEN_LOOP_START_FOC;
+                system_state = SYSTEM_STARTUP_FOC_OPENLOOP;
                 SMO_Init(&SMO);
                 NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
                 Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
@@ -1365,7 +1355,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
             {
 				system_state = SYSTEM_READY;
 				// Only for Testing enable IRQ and setting system state here.
-				system_state = SYSTEM_PRE_ALIGNMENT;
+				system_state = SYSTEM_STARTUP_FOC_PREALIGN;
 				NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
 				_prealign_start();
             }
@@ -1383,7 +1373,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 			else adc_meas_valid = false;
         }
         
-        if (system_state == SYSTEM_PRE_ALIGNMENT && inj_collect_now)
+        if (system_state == SYSTEM_STARTUP_FOC_PREALIGN && inj_collect_now)
         {
 			float32_t ialpha, ibeta;
 		    _clarke_ab(adc_meas.iu, adc_meas.iv, adc_meas.iw, &ialpha, &ibeta);
@@ -1656,7 +1646,7 @@ void Poti_read(void)
     we_ref = (float32_t)raw_value_idPot / 4095.0f * 6400.0;
     
     raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(10U);
-    PrintVars.k = (float32_t)raw_value_idPot / 4095.0f * 3.0;
+    PrintVars.a = (float32_t)raw_value_idPot / 4095.0f * 1000.0;
 }
 
 /*******************************************************************************
@@ -1779,7 +1769,7 @@ int main(void)
 		
 		/* UART */
         char print_Array[33];
-        float32_t data_Array[8] = {PrintVars.id, PrintVars.iq, PrintVars.iq_ref, PrintVars.vd, PrintVars.vq, PrintVars.we, PrintVars.we_ref, PrintVars.we_hall};
+        float32_t data_Array[8] = {PrintVars.ea, PrintVars.eb, PrintVars.eaf, PrintVars.ebf, PrintVars.wHat, PrintVars.WHatf, PrintVars.we, PrintVars.a};
         print_Array[0] = 0xAA;
         memcpy(&print_Array[1], data_Array, sizeof(data_Array));
         for (int i = 0; i < (int)sizeof(print_Array); i++) 
