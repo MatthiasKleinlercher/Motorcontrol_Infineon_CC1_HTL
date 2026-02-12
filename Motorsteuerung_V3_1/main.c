@@ -220,8 +220,8 @@ typedef struct
 // Hall measurmente
 typedef struct
 {
-    volatile uint8_t   lut_idx;        // 0..5
-    volatile uint8_t   prev_lut_idx;	  // 0..5
+    volatile uint8_t   lut_idx;    
+    volatile uint8_t   prev_lut_idx;
     volatile int8_t    direction;      // +1 = math. pos / -1 = math. negative / 0
     
     volatile uint32_t  prev_Count;
@@ -231,6 +231,9 @@ typedef struct
 	volatile float32_t correct_theta;
 	
 	volatile float32_t we_hall;
+	
+	volatile uint32_t last_edge_cnt;
+	volatile float32_t theta_sector;
 } hall_meas_t;
 
 enum {
@@ -315,10 +318,37 @@ typedef struct
 * Global Variables
 *******************************************************************************/
 
-// Finite State Machine
+// ===== Control selection / FSM requests =====
 typedef enum {SYSTEM_OFF, SYSTEM_INIT, SYSTEM_CALIBRATION, SYSTEM_READY, SYSTEM_STARTUP_FOC_PREALIGN, SYSTEM_STARTUP_FOC_OPENLOOP, SYSTEM_RUN_FOC, SYSTEM_STARTUP_BLOCK, SYSTEM_RUN_BLOCK, SYSTEM_SHUTDOWN, SYSTEM_FAULT} system_state_t;
-// SYSTEM_CLOSED_LOOP_SENSORED_FOC, SYSTEM_CLOSED_LOOP_SENSORLESS_FOC, SYSTEM_CLOSED_LOOP_FOC_SHUTDOWN, SYSTEM_OPEN_LOOP_FOC_SHUTDOWN
 volatile system_state_t system_state = SYSTEM_OFF;
+
+typedef enum { CTRL_FOC = 0, CTRL_BLOCK = 1 } ctrl_mode_t;
+typedef enum { FOC_FB_SENSORLESS = 0, FOC_FB_HALL = 1 } foc_fb_t;
+
+volatile ctrl_mode_t g_ctrl_desired = CTRL_FOC;
+volatile ctrl_mode_t g_ctrl_active  = CTRL_FOC;
+
+volatile foc_fb_t    g_foc_fb_desired = FOC_FB_SENSORLESS;
+volatile foc_fb_t    g_foc_fb_active  = FOC_FB_SENSORLESS;
+
+// Start/Stop/Switch requests (set in main loop / safety ISR)
+volatile bool g_req_start = false;
+volatile bool g_req_stop  = false;
+
+// Auto-restart after stopping (used for CTRL switch)
+volatile bool g_auto_restart = false;
+volatile ctrl_mode_t g_restart_ctrl = CTRL_FOC;
+
+// Shutdown completion flag (set in controller ISR)
+volatile bool g_shutdown_done = false;
+
+// optional: how to stop (coast vs brake)
+typedef enum { STOP_COAST = 0, STOP_BRAKE_LOW_SIDE = 1 } stop_mode_t;
+volatile stop_mode_t g_stop_mode = STOP_COAST;
+
+// FOC openloop init (seed angle from prealign)
+volatile bool g_foc_openloop_init_done = false;
+volatile float32_t g_foc_theta_init = 0.0f;
 
 // Interruptconfig
 cy_stc_sysint_t Controller_counter_intr_config = { .intrSrc = Controller_Counter_IRQ, .intrPriority = 4U };
@@ -353,6 +383,9 @@ volatile float32_t last_imag = 0.0f;       // ADC-ISR writes values in Peak
 
 // Hall measurement
 static hall_meas_t hall_values = {};
+
+// Block pi controller
+static PI_t g_pi_block_speed;
 
 // Test Vars
 volatile Print_t PrintVars;
@@ -404,7 +437,19 @@ void init_pi_speed(PI_t *s);
 static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we);
 void Poti_read(void);
 void safety_intr_handler();
-				 
+static inline void _pwm_all_enable();
+static inline void _pwm_all_disable();
+static inline void _motor_outputs_stop_now();
+uint8_t read_hall_state(void);
+inline int8_t _get_direction(uint8_t lut_idx, uint8_t prev_lut_idx);
+inline float32_t _get_correct_theta(uint8_t lut_idx, uint8_t prev_lut_idx);
+void hall_interrupt_handler(void);
+static inline float32_t _HALL_get_theta(const hall_meas_t* h);
+static inline float32_t _HALL_get_we(hall_meas_t* hall);
+static void init_pi_block_speed(PI_t *s);
+static inline float32_t block_get_duty_from_speed(float32_t we_ref_cmd, float32_t we_meas);
+static void system_fsm_step();
+static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_math_pos);
 
 /*******************************************************************************
 * Function Definitions
@@ -425,6 +470,65 @@ void safety_intr_handler();
 *  int
 *
 *******************************************************************************/
+
+/*******************************************************************************
+* Function Name: static inline void _pwm_all_enable()
+
+* enables all three PWM Counter
+*******************************************************************************/
+
+static inline void _pwm_all_enable()
+{
+    Cy_TCPWM_PWM_Enable(PWM_Counter_U_HW, PWM_Counter_U_NUM);
+    Cy_TCPWM_PWM_Enable(PWM_Counter_V_HW, PWM_Counter_V_NUM);
+    Cy_TCPWM_PWM_Enable(PWM_Counter_W_HW, PWM_Counter_W_NUM);
+}
+
+/******************************************************************************/
+
+/*******************************************************************************
+* Function Name: static inline void _pwm_all_disable()
+
+* disables all three PWM Counter
+*******************************************************************************/
+
+static inline void _pwm_all_disable()
+{
+    Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_U_HW, PWM_Counter_U_NUM, 0u);
+    Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_V_HW, PWM_Counter_V_NUM, 0u);
+    Cy_TCPWM_PWM_SetCompare0BufVal(PWM_Counter_W_HW, PWM_Counter_W_NUM, 0u);
+
+    Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_U_HW, PWM_Counter_U_NUM);
+    Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_V_HW, PWM_Counter_V_NUM);
+    Cy_TCPWM_TriggerCaptureOrSwap_Single(PWM_Counter_W_HW, PWM_Counter_W_NUM);
+
+    Cy_TCPWM_PWM_Disable(PWM_Counter_U_HW, PWM_Counter_U_NUM);
+    Cy_TCPWM_PWM_Disable(PWM_Counter_V_HW, PWM_Counter_V_NUM);
+    Cy_TCPWM_PWM_Disable(PWM_Counter_W_HW, PWM_Counter_W_NUM);
+}
+
+/******************************************************************************/
+
+/*******************************************************************************
+* Function Name: static inline void _motor_outputs_stop_now()
+
+* Stops the motor
+*******************************************************************************/
+
+static inline void _motor_outputs_stop_now()
+{
+    if (g_stop_mode == STOP_BRAKE_LOW_SIDE)
+    {
+        _pwm_all_enable();
+        low_sides_all_on();
+    }
+    else
+    {
+        _pwm_all_disable();
+    }
+}
+
+/******************************************************************************/
 
 /*******************************************************************************
 * Function Name: void low_sides_all_on(void)
@@ -557,6 +661,26 @@ static inline void _svpwm(float32_t Va, float32_t Vb, float32_t Vc, float32_t ov
 * -
 *******************************************************************************/
 /* TODO: Has to be documented */
+
+static void block_start(void)
+{
+    g_ctrl_active = CTRL_BLOCK;
+    
+    init_pi_block_speed(&g_pi_block_speed);
+    
+    _pwm_all_enable();
+    NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
+    Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
+
+    system_state = SYSTEM_RUN_BLOCK;
+}
+
+static inline float32_t block_get_duty_from_speed(float32_t we_ref_cmd, float32_t we_meas)
+{
+    float32_t duty = _pi_controller_step(&g_pi_block_speed, we_ref_cmd, fabsf(we_meas));
+    return _sat(duty, 0.0f, 0.95f);
+}
+
 static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_math_pos)
 {	
 	/*TODO: Check if Arrays are correct for clock and countclockwise*/
@@ -757,10 +881,45 @@ void safety_intr_handler()
 {
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Safety_Counter_HW, Safety_Counter_NUM);
 	
-	//system_state = SYSTEM_OFF;
-	//low_sides_all_on();
+	if (system_state == SYSTEM_RUN_FOC || system_state == SYSTEM_RUN_BLOCK || system_state == SYSTEM_STARTUP_FOC_OPENLOOP)
+    {
+        g_req_stop = true;
+        g_auto_restart = false;
+        system_state = SYSTEM_SHUTDOWN;
+    }
 	
 	Cy_TCPWM_ClearInterrupt(Safety_Counter_HW, Safety_Counter_NUM, intrStatus);
+}
+/******************************************************************************/
+
+/*******************************************************************************
+* Function Name: 
+
+* 
+*******************************************************************************/
+static inline void foc_switch_feedback(foc_fb_t new_fb)
+{
+    if (new_fb == g_foc_fb_active) return;
+
+    if (new_fb == FOC_FB_HALL)
+    {
+        if (hall_values.lut_idx == 255u) return;
+        g_foc_fb_active = FOC_FB_HALL;
+        return;
+    }
+
+    float32_t th_h = _HALL_get_theta(&hall_values);
+    float32_t we_h = _HALL_get_we(&hall_values);
+
+    __disable_irq();
+    SMO.theta_hat   = _wrap_pi(th_h - SMO.theta_shift);
+    SMO.theta_rad   = th_h;
+    SMO.omega_hat   = we_h;
+    SMO.omega_hat_f = we_h;
+    SMO.integ_e     = we_h; 
+    __enable_irq();
+
+    g_foc_fb_active = FOC_FB_SENSORLESS;
 }
 /******************************************************************************/
 
@@ -895,6 +1054,16 @@ const float32_t lut_to_theta[6] =
 	-0.26179939
 };
 
+const float32_t lut_to_theta_sector[6] = 
+{
+	0.0,
+	1.04719755,
+	2.0943951,
+	3.14159265,
+	-2.0943951,
+	-1.04719755
+};
+
 uint8_t read_hall_state(void)
 {
     uint8_t H1 = Cy_GPIO_Read(HALL1_PORT, HALL1_PIN);
@@ -926,14 +1095,21 @@ void hall_interrupt_handler(void)
 {
 	
 	uint8_t lut_index = hall_to_lut[read_hall_state()];
+    if (lut_index == 255U)
+    {
+        Cy_GPIO_ClearInterrupt(HALL1_PORT, HALL1_PIN);
+        Cy_GPIO_ClearInterrupt(HALL2_PORT, HALL2_PIN);
+        Cy_GPIO_ClearInterrupt(HALL3_PORT, HALL3_PIN);
+        return;
+    }
+	
 	
 	hall_values.lut_idx = lut_index;
 	//hall_values.direction = _get_direction(lut_index, hall_values.prev_lut_idx);
+	hall_values.theta_sector = lut_to_theta_sector[lut_index];
 	//hall_values.correct_theta = _get_correct_theta(lut_index, hall_values.prev_lut_idx);
-	
 	if (hall_values.correct_theta != 0.0) hall_values.correct_angle_set = true;
 	else hall_values.correct_theta = false;
-	
 	hall_values.prev_lut_idx = lut_index;
 	
 	if (Cy_TCPWM_Counter_GetStatus(Safety_Counter_HW, Safety_Counter_NUM) & CY_TCPWM_COUNTER_STATUS_COUNTER_RUNNING)
@@ -947,26 +1123,45 @@ void hall_interrupt_handler(void)
 	{
 		uint32_t count = Cy_TCPWM_Counter_GetCounter(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
 		if (hall_values.overflow == false)
-		{
-			if (count > hall_values.prev_Count)
-			{
-				uint32_t diff_count = count - hall_values.prev_Count;
-				float32_t timePerHall = (float32_t)diff_count/(float32_t)SysFreq;
-				hall_values.we_hall = TWO_PI/(timePerHall * (float32_t)LUT_SIZE);
-			}
-			hall_values.prev_Count = count;
-		}
+        {
+            uint32_t diff_count = (count - hall_values.prev_Count);
+            if (diff_count > 0u)
+            {
+                float32_t timePerHall = (float32_t)diff_count / (float32_t)SysFreq;
+                float32_t we_mag = TWO_PI / (timePerHall * (float32_t)LUT_SIZE);
+
+                int8_t dir = hall_values.direction;
+                if (dir == 0) dir = +1;
+                hall_values.we_hall = (float32_t)dir * we_mag;
+            }
+            hall_values.prev_Count = count;
+        }
 		else 
 		{
 			hall_values.prev_Count = count;
 			hall_values.overflow = false;	
 		}
+		hall_values.last_edge_cnt = count;
 	}
-	else Cy_TCPWM_TriggerStart_Single(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
+	else 
+	{
+		Cy_TCPWM_TriggerStart_Single(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
+        hall_values.prev_Count = Cy_TCPWM_Counter_GetCounter(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
+        hall_values.last_edge_cnt = hall_values.prev_Count;
+	}
 	
     Cy_GPIO_ClearInterrupt(HALL1_PORT, HALL1_PIN);
     Cy_GPIO_ClearInterrupt(HALL2_PORT, HALL2_PIN);
     Cy_GPIO_ClearInterrupt(HALL3_PORT, HALL3_PIN);
+}
+
+static inline float32_t _HALL_get_theta(const hall_meas_t* h)
+{
+    uint32_t now = Cy_TCPWM_Counter_GetCounter(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
+    uint32_t diff = (now - h->last_edge_cnt);
+    float32_t dt = (float32_t)diff / (float32_t)SysFreq;
+
+    return _wrap_pi(h->theta_sector + h->we_hall * dt);
 }
 
 static inline float32_t _HALL_get_we(hall_meas_t* hall) {return hall->we_hall;}
@@ -1017,17 +1212,17 @@ static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we)
 /******************************************************************************/
 
 /*******************************************************************************
-* Function Name: void speed_measurment_intr_handler(void)
+* Function Name: void controller_counter_intr_handler()
 
-* Interrupt handler uses Hall signals to calculate the electical and machincal speed of the machine
+* Interrupt handler for controller
 *******************************************************************************/
 void controller_counter_intr_handler()
 {
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Controller_Counter_HW, Controller_Counter_NUM);
 	
 	meas_si_t measurment_data = adc_meas;
-	float32_t ialpha, ibeta;
-	float32_t valpha_measured, vbeta_measured;
+	float32_t ialpha = 0.0, ibeta = 0.0;
+	float32_t valpha_measured = 0.0, vbeta_measured = 0.0;
 	_clarke_ab(measurment_data.iu, measurment_data.iv, measurment_data.iw, &ialpha, &ibeta);
 	_clarke_ab(measurment_data.vu, measurment_data.vv, measurment_data.vw, &valpha_measured, &vbeta_measured);
 	_SMO_Update(&SMO, ialpha, ibeta, valpha_measured, vbeta_measured);
@@ -1036,11 +1231,77 @@ void controller_counter_intr_handler()
 	PrintVars.we_hall = _HALL_get_we(&hall_values);
 	PrintVars.we =  _SMO_GetOmega(&SMO);
 	
+	// =========================
+    // SHUTDOWN handling
+    // =========================
+	
+	if (system_state == SYSTEM_SHUTDOWN)
+	{
+		static bool shutdown_entry = true;
+		static uint16_t stop_cnt = 0;
+		
+		if (shutdown_entry)
+		{
+			_motor_outputs_stop_now();
+			stop_cnt = 0;
+			shutdown_entry = false;
+		}
+		
+		float32_t we_m = 0.0;
+		if (g_ctrl_active == CTRL_BLOCK) we_m = _HALL_get_we(&hall_values);
+		else
+ 		{
+			if (g_foc_fb_active == FOC_FB_HALL) we_m = _HALL_get_we(&hall_values);
+            else we_m = _SMO_GetOmega(&SMO);
+ 		}
+ 		
+ 		const float32_t WE_STOP_THR = 20.0;
+ 		const uint16_t STOP_SAMPLES = 2500;
+ 		
+ 		if (fabsf(we_m) < WE_STOP_THR) stop_cnt++;
+        else stop_cnt = 0;
+
+        if (stop_cnt >= STOP_SAMPLES)
+        {
+            g_shutdown_done = true;
+            shutdown_entry = true;
+        }
+
+        Cy_TCPWM_ClearInterrupt(Controller_Counter_HW, Controller_Counter_NUM, intrStatus);
+        return;
+	}
+	
+	// =========================
+    // BLOCK RUN
+    // =========================
+    if (system_state == SYSTEM_RUN_BLOCK)
+    {	
+        float32_t we_m = _HALL_get_we(&hall_values);
+
+        float32_t duty = block_get_duty_from_speed(we_ref, we_m);
+        bool dir_math_pos = (hall_values.direction >= 0);
+        _Block(duty, hall_values.lut_idx, dir_math_pos);
+
+        Cy_TCPWM_ClearInterrupt(Controller_Counter_HW, Controller_Counter_NUM, intrStatus);
+        return;
+    }
+	
+	// =========================
+    // FOC OPENLOOP / RUN
+    // =========================
+	
 	static float32_t th = 0.0; // TODO: Theta muss von anderen Systemen kommen
 	static float32_t we = 0.0; // TODO: Omega_e muss von anderen Systemen kommen
 	static PI_t d;
 	static PI_t q;
 	static PI_t speed;
+	
+	if (system_state == SYSTEM_STARTUP_FOC_OPENLOOP && !g_foc_openloop_init_done)
+    {
+        th = g_foc_theta_init;
+        we = 0.0f;
+        g_foc_openloop_init_done = true;
+    }
 	
 	if (system_state == SYSTEM_STARTUP_FOC_OPENLOOP)
 	{
@@ -1052,22 +1313,23 @@ void controller_counter_intr_handler()
 	}
 	else if(system_state == SYSTEM_RUN_FOC)
 	{
-		we = _SMO_GetOmega(&SMO);
-		th = _SMO_GetTheta(&SMO);
+		if (g_foc_fb_desired != g_foc_fb_active)
+        {
+            foc_switch_feedback(g_foc_fb_desired);
+        }
+
+        if (g_foc_fb_active == FOC_FB_HALL)
+        {
+            we = _HALL_get_we(&hall_values);
+            th = _HALL_get_theta(&hall_values);
+        }
+        
+        else
+        {
+            we = _SMO_GetOmega(&SMO);
+            th = _SMO_GetTheta(&SMO);
+        }
 	}
-	/*else if(system_state == SYSTEM_OPEN_LOOP_FOC_SHUTDOWN)
-	{
-		//TODO: Check with Infineon how to get interrupt Time.
-		const float32_t SHUT_DOWN_TIME = 8.0;
-		const float32_t CALL_TIME = 1.0/25000.0;
-		we -= we_shutDown * CALL_TIME/SHUT_DOWN_TIME;
-		if (we <= 5.0) 
-		{
-			we = 0.0;
-			system_state = SYSTEM_OFF;
-		}
-		th = _wrap_pi(th + CALL_TIME * we);
-	}*/
 	
 	//Only for testing Print vars
 	PrintVars.we = we;
@@ -1105,13 +1367,23 @@ void controller_counter_intr_handler()
 		vd = _pi_controller_step(&d, 0.0, id);
 		vq = _pi_controller_step(&q, iq_ref, iq);
 	}
+	else
+	{
+		vd = 0.0;
+		vq = 0.0;	
+	}
 	
 	float32_t valpha, vbeta;
 	_inv_park_ab(vd, vq, s, c, &valpha, &vbeta);
 	
 	float32_t va, vb, vc;
 	_inv_clarke_abc(valpha, vbeta, &va, &vb, &vc);
-	_svpwm(va, vb, vc, 0.5);
+	
+	if (system_state == SYSTEM_STARTUP_FOC_OPENLOOP || system_state == SYSTEM_RUN_FOC)
+    {
+        _pwm_all_enable();
+        _svpwm(va, vb, vc, 0.5f);
+    }
 	
 	Cy_TCPWM_ClearInterrupt(Controller_Counter_HW, Controller_Counter_NUM, intrStatus);
 }
@@ -1151,6 +1423,18 @@ void init_pi_speed(PI_t *s)
 	s->prevU		= 0.0;
 	s->useIntFlag	= true;
 }
+
+static void init_pi_block_speed(PI_t *s)
+{
+    s->ki = 3.0;
+    s->kp = 0.0004;
+    s->out_max = 0.99;
+    s->out_min = 0.0f;
+    s->Ts = CONTROLLER_INTERRUPT_TIME;
+    s->prevE = 0.0f;
+    s->prevU = 0.0f;
+    s->useIntFlag = true;
+}
 /******************************************************************************/
 
 /*******************************************************************************
@@ -1180,6 +1464,7 @@ void pwm_reload_intr_handler()
 *******************************************************************************/
 static inline void _prealign_start(void)
 {
+	NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
     memset(&preAlignment, 0, sizeof(preAlignment));
 
     preAlignment.st = INJ_NEXT;
@@ -1266,13 +1551,11 @@ static inline void _prealign_step_pwm(void)
 
         case INJ_DONE:
         {
-            // Bestes theta0 finden
             int k = _argmax_f32(preAlignment.peaks, preAlignment.theta_count);
             float32_t theta0 = preAlignment.theta_list[k];
 
             if (preAlignment.stage == 0)
             {
-                // fein um theta0, delta=15° (in rad)
                 preAlignment.stage = 1;
                 preAlignment.inj_m = M_FINE;
                 _prepare_six_around(&preAlignment, theta0, _DEG2RAD_F(15.0f));
@@ -1280,7 +1563,6 @@ static inline void _prealign_step_pwm(void)
             }
             else if (preAlignment.stage == 1)
             {
-                // noch feiner, delta=7.5°
                 preAlignment.stage = 2;
                 preAlignment.inj_m = M_FINE;
                 _prepare_six_around(&preAlignment, theta0, _DEG2RAD_F(7.5f));
@@ -1288,7 +1570,6 @@ static inline void _prealign_step_pwm(void)
             }
             else if (preAlignment.stage == 2)
             {
-                // Polaritätstest: theta0 und theta0+pi
                 preAlignment.stage = 3;
                 preAlignment.inj_m = M_POL;
                 preAlignment.theta_est_rad = theta0;
@@ -1297,21 +1578,21 @@ static inline void _prealign_step_pwm(void)
             }
             else
             {
-                // stage==3 -> Polarität auswerten
                 int k2 = _argmax_f32(preAlignment.peaks, 2);
                 preAlignment.theta_polar_is_north = (k2 == 0);
 
-                // Wenn das größere Peak bei theta+pi ist -> Winkel um pi drehen
                 float32_t theta_final = preAlignment.theta_est_rad;
                 if (k2 == 1) theta_final = _wrap_pi(theta_final + PI);
 
-                // >>> Ergebniswinkel in [-pi,pi) <<<
-                // Hier in deine FOC/Estimator-Variablen übernehmen:
-                preAlignment.theta_e_rad_final = theta_final;     // deine globale elektrische Anfangslage
+                preAlignment.theta_e_rad_final = theta_final;
 				preAlignment.theta_e_rad_final_ready = true;
 				NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
                 // Prealignment beendet:
                 preAlignment.st = INJ_IDLE;
+                g_ctrl_active = CTRL_FOC;
+				g_foc_fb_active = g_foc_fb_desired;
+				g_foc_openloop_init_done = false;
+				g_foc_theta_init = preAlignment.theta_e_rad_final;
                 system_state = SYSTEM_STARTUP_FOC_OPENLOOP;
                 SMO_Init(&SMO);
                 NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
@@ -1354,10 +1635,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 			if (adc_calibration.done)
             {
 				system_state = SYSTEM_READY;
-				// Only for Testing enable IRQ and setting system state here.
-				system_state = SYSTEM_STARTUP_FOC_PREALIGN;
-				NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
-				_prealign_start();
+				_motor_outputs_stop_now();
             }
 		}
 		else
@@ -1640,6 +1918,62 @@ void calibration_init()
 }
 /******************************************************************************/
 
+/*******************************************************************************
+* Function Name: static void system_fsm_step()
+
+
+*******************************************************************************/
+static void system_fsm_step()
+{
+    if (g_req_stop)
+    {
+        g_req_stop = false;
+
+        if (system_state == SYSTEM_RUN_FOC || system_state == SYSTEM_RUN_BLOCK ||
+            system_state == SYSTEM_STARTUP_FOC_OPENLOOP)
+        {
+            system_state = SYSTEM_SHUTDOWN;
+        }
+    }
+
+    if (system_state == SYSTEM_SHUTDOWN && g_shutdown_done)
+    {
+        g_shutdown_done = false;
+
+        _motor_outputs_stop_now();
+
+        if (g_auto_restart)
+        {
+            g_auto_restart = false;
+            g_ctrl_desired = g_restart_ctrl;
+            g_req_start = true;
+        }
+
+        system_state = SYSTEM_READY;
+    }
+
+    if (system_state == SYSTEM_READY && g_req_start)
+    {
+        g_req_start = false;
+
+        if (g_ctrl_desired == CTRL_FOC)
+        {
+            g_ctrl_active = CTRL_FOC;
+            g_foc_fb_active = g_foc_fb_desired;
+
+            system_state = SYSTEM_STARTUP_FOC_PREALIGN;
+            _pwm_all_enable();
+            NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
+            _prealign_start();
+        }
+        else
+        {
+            block_start();
+        }
+    }
+}
+/******************************************************************************/
+
 void Poti_read(void)
 {
     int32_t raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(12U);
@@ -1750,26 +2084,96 @@ int main(void)
     __enable_irq();
     
     init();
-    static bool button_pressed_before = false;
+    static uint8_t sw1_prev = 0, sw2_prev = 0;
 
     for (;;)
     {
-		if (Cy_GPIO_Read(SW2_PORT, SW2_NUM) == 1UL && button_pressed_before == false)
-		{
-			button_pressed_before = true;
-			
-			if (system_state == SYSTEM_OFF) system_state = SYSTEM_CALIBRATION;
-			
-			
-		}
-		else if (Cy_GPIO_Read(SW2_PORT, SW2_NUM) == 0UL)
-		{
-			button_pressed_before = false;
-		}
+		/*
+		
+		READY:
+		SW1 toggelt FOC <-> BLOCK
+		SW2 startet mit der Auswahl
+		
+		RUN_FOC:
+		SW1 toggelt sensorless <-> hall
+		SW1+SW2 gleichzeitig drücken: FOC <-> BLOCK (stop + auto restart)
+		SW2: Stop
+		
+		RUN_BLOCK:
+		SW1: Wechsel zu FOC (stop + auto restart)		
+		SW2: Stop
+		
+		*/
+		
+		uint8_t sw1 = (uint8_t)Cy_GPIO_Read(SW1_PORT, SW1_NUM);
+	    uint8_t sw2 = (uint8_t)Cy_GPIO_Read(SW2_PORT, SW2_NUM);
+	
+	    bool sw1_rise = (sw1 == 1u && sw1_prev == 0u);
+	    bool sw2_rise = (sw2 == 1u && sw2_prev == 0u);
+		
+		// --- READY: select mode + start ---
+	    if (system_state == SYSTEM_READY)
+	    {
+	        if (sw1_rise)
+	        {
+	            g_ctrl_desired = (g_ctrl_desired == CTRL_FOC) ? CTRL_BLOCK : CTRL_FOC;
+	        }
+	        if (sw2_rise)
+	        {
+	            g_req_start = true;
+	        }
+	    }
+	
+	    // --- RUN_FOC ---
+	    if (system_state == SYSTEM_RUN_FOC)
+	    {
+	        if (sw1_rise && !sw2)
+	        {
+	            // toggle feedback
+	            g_foc_fb_desired = (g_foc_fb_desired == FOC_FB_SENSORLESS) ? FOC_FB_HALL : FOC_FB_SENSORLESS;
+	        }
+	
+	        if (sw2_rise && sw1)
+	        {
+	            // SWITCH CTRL: stop + auto restart in other mode
+	            g_restart_ctrl = CTRL_BLOCK;
+	            g_auto_restart = true;
+	            g_req_stop = true;
+	        }
+	        else if (sw2_rise)
+	        {
+	            // Stop
+	            g_auto_restart = false;
+	            g_req_stop = true;
+	        }
+	    }
+	
+	    // --- RUN_BLOCK ---
+	    if (system_state == SYSTEM_RUN_BLOCK)
+	    {
+	        if (sw1_rise)
+	        {
+	            // switch to FOC (stop + auto restart)
+	            g_restart_ctrl = CTRL_FOC;
+	            g_auto_restart = true;
+	            g_req_stop = true;
+	        }
+	        else if (sw2_rise)
+	        {
+	            g_auto_restart = false;
+	            g_req_stop = true;
+	        }
+	    }
+	
+	    sw1_prev = sw1;
+	    sw2_prev = sw2;
+	
+	    // FSM progresses here
+	    system_fsm_step();
 		
 		/* UART */
-        char print_Array[33];
-        float32_t data_Array[8] = {PrintVars.ea, PrintVars.eb, PrintVars.eaf, PrintVars.ebf, PrintVars.wHat, PrintVars.WHatf, PrintVars.we, PrintVars.a};
+        char print_Array[9];
+        float32_t data_Array[2] = {PrintVars.we, PrintVars.we_hall};
         print_Array[0] = 0xAA;
         memcpy(&print_Array[1], data_Array, sizeof(data_Array));
         for (int i = 0; i < (int)sizeof(print_Array); i++) 
