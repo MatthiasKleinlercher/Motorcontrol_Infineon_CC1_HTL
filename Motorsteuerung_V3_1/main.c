@@ -244,6 +244,36 @@ enum {
     HALL_FAULT_TIMEOUT       = 1u << 3,
 };
 
+// Communication
+typedef struct
+{
+	float32_t target_speed; //[U/min]
+	float32_t target_iq;	   // [A]
+	uint8_t control_mode;
+	uint8_t enable_motor;
+	uint8_t start;
+	uint8_t direction_cc;
+	uint8_t foc;
+	uint8_t sensorless;
+}rx_t;
+
+typedef struct
+{
+	uint32_t speed;		//[mU/min]
+	uint16_t torgue;	//[mNm]
+	uint16_t i_bus;		//[mA]
+	uint16_t v_bus;		//[mV]
+	uint16_t pcb_temp;	//[m°C]
+	uint16_t winding_temp; //[m°C]
+	uint16_t id; //[mA]
+	uint16_t iq; //[mA]
+	uint16_t vd; //[mV]
+	uint16_t vq; //[mV]
+	uint8_t error;
+	uint8_t warning;
+}tx_t;
+
+
 // Params for pre alignment
 #define M_COARSE              (0.1f)
 #define M_FINE                (0.1f)
@@ -284,10 +314,15 @@ enum {
 #define C                                   2
 
 //Controller Interrupt Time
-#define CONTROLLER_INTERRUPT_TIME 0.00004
+#define CONTROLLER_INTERRUPT_TIME 0.00016  // 160 µs
 
 // Voltage supoply
 #define VDD 36.0
+
+//Communication
+#define DBG_STARTBYTE   (0xAAu)
+#define DBG_WORDS       (8u)
+#define DBG_PAYLOAD_LEN (DBG_WORDS * 4u)   // 32 Bytes
 
 // print global vars
 typedef struct
@@ -330,14 +365,14 @@ typedef enum {	SWITCH_CTRL_METHODE,
 volatile system_req_t system_req = NO_REQ;
 
 // Interruptconfig
-cy_stc_sysint_t Controller_counter_intr_config = { .intrSrc = Controller_Counter_IRQ, .intrPriority = 4U };
-cy_stc_sysint_t Speed_Measurment_intr_config   = { .intrSrc = Speed_Measurment_Counter_IRQ, .intrPriority = 5U };
-cy_stc_sysint_t hall_isr3_config               = { .intrSrc = ioss_interrupts_sec_gpio_8_IRQn, .intrPriority = 2U };
-cy_stc_sysint_t hall_isr12_config              = { .intrSrc = ioss_interrupts_sec_gpio_9_IRQn, .intrPriority = 2U };
-cy_stc_sysint_t fifo_isr_cfg             	   = { .intrSrc = pass_interrupt_fifos_IRQn, .intrPriority = 3U };
-cy_stc_sysint_t set_value_intr_config          = { .intrSrc = Test_Counter_IRQ, .intrPriority = 1U };
-cy_stc_sysint_t pwm_reload_intr_config         = { .intrSrc = PWM_Counter_U_IRQ, .intrPriority =6U};
-cy_stc_sysint_t Safety_intr_config			   = { .intrSrc = Safety_Counter_IRQ, .intrPriority = 7U};
+cy_stc_sysint_t Controller_counter_intr_config = { .intrSrc = Controller_Counter_IRQ, .intrPriority = 2U };
+cy_stc_sysint_t Speed_Measurment_intr_config   = { .intrSrc = Speed_Measurment_Counter_IRQ, .intrPriority = 3U };
+cy_stc_sysint_t hall_isr3_config               = { .intrSrc = ioss_interrupts_sec_gpio_8_IRQn, .intrPriority = 0U };
+cy_stc_sysint_t hall_isr12_config              = { .intrSrc = ioss_interrupts_sec_gpio_9_IRQn, .intrPriority = 0U };
+cy_stc_sysint_t fifo_isr_cfg             	   = { .intrSrc = pass_interrupt_fifos_IRQn, .intrPriority = 1U };
+cy_stc_sysint_t pwm_reload_intr_config         = { .intrSrc = PWM_Counter_U_IRQ, .intrPriority =4U};
+cy_stc_sysint_t Safety_intr_config			   = { .intrSrc = Safety_Counter_IRQ, .intrPriority = 5U};
+cy_stc_sysint_t Uart_intr_config			   = { .intrSrc = Message_Counter_IRQ, .intrPriority = 6U};
 
 // DEBUG_UART
 static cy_stc_scb_uart_context_t DEBUG_UART_context;
@@ -366,9 +401,12 @@ static hall_meas_t hall_values = {};
 // Block pi controller
 static PI_t g_pi_block_speed;
 
+// Communication
+volatile rx_t rxData;
+volatile tx_t txData;
+
 // Test Vars
 volatile Print_t PrintVars;
-float32_t we_ref = 800.0;
 /*******************************************************************************
 * Functions
 *******************************************************************************/
@@ -430,7 +468,12 @@ static inline float32_t block_get_duty_from_speed(float32_t we_ref_cmd, float32_
 static void system_fsm_step();
 static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_math_pos);
 static inline void foc_switch_ctrl_methode();
-
+static inline uint16_t le16(const uint8_t *p);
+static inline uint32_t le32(const uint8_t *p);
+bool DebugUart_TryReadPacket(void);
+static inline void wr16le(uint8_t *p, uint16_t v);
+static inline void wr32le(uint8_t *p, uint32_t v);
+void DebugUart_SendTxPacket(void);
 /*******************************************************************************
 * Function Definitions
 *******************************************************************************/
@@ -1161,7 +1204,7 @@ static inline float32_t _pi_controller_step(PI_t *c, float32_t setpoint, float32
 static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we)
 {
 	const float32_t vq_boost = 1.0;
-	const float32_t we_ramp = 0.002; //[V/rad/s]
+	const float32_t we_ramp = 0.008; //[V/rad/s]
 	
 	*vd = 0.0;
 	*vq = vq_boost + we_ramp * we;
@@ -1179,9 +1222,17 @@ void controller_counter_intr_handler()
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Controller_Counter_HW, Controller_Counter_NUM);
 	
 	const float32_t OL_TIME = 5.0;
-	const float32_t OL_WE = 800.0;
+	const float32_t OL_WE = 200.0;
 	const float32_t OL_DUTY = 0.2;
-	const float32_t CALL_TIME = 1.0/25000.0;
+	const float32_t CALL_TIME = CONTROLLER_INTERRUPT_TIME;
+	
+	float32_t we_ref = rxData.target_speed/60.0 * 4.0;
+	we_ref = _sat(we_ref, 200.0, 1675.0);
+	//TODO: Test
+	PrintVars.we_ref = we_ref;
+	
+	float32_t iq_ref = rxData.target_iq;
+	we_ref = _sat(we_ref, 0.1, 30.0);
 	
 	// =========================
     // BLOCK
@@ -1290,7 +1341,6 @@ void controller_counter_intr_handler()
 			s = sinf(th);
 			_park_dq(ialpha, ibeta, s, c, &id, &iq);
 			
-			static float32_t iq_ref = 0.0f;
 		    static uint8_t count = 10;
 		    if (count >= 9)
 		    {
@@ -1299,7 +1349,7 @@ void controller_counter_intr_handler()
 					we_ref = OL_WE;
 					if (we <= OL_WE + 10.0) system_state = SYSTEM_SHUTDOWN_FOC;
 				}
-		        iq_ref = _pi_controller_step(&speed, we_ref, we);
+		        if(rxData.control_mode == 0U)iq_ref = _pi_controller_step(&speed, we_ref, we);
 		        count = 0;
 		    }
 		    else count++;
@@ -1374,8 +1424,8 @@ void init_pi_speed(PI_t *s)
 {
 	s->ki 			= 2.7;
 	s->kp			= 0.1;
-	s->out_max		= 3.0;
-	s->out_min		= -3.0;
+	s->out_max		= 20.0;
+	s->out_min		= 0.1;
 	s->Ts			= CONTROLLER_INTERRUPT_TIME*10.0;
 	s->prevE		= 0.0;
 	s->prevU		= 0.0;
@@ -1598,7 +1648,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
             meas_si_t tmp;
             if (_adc_frame_to_si(&frame, &tmp))
 			{
-			    adc_meas = tmp;     
+			    adc_meas = tmp;
 			    adc_meas_valid = true;
 			}
 			else adc_meas_valid = false;
@@ -1912,14 +1962,125 @@ static void system_fsm_step()
 }
 /******************************************************************************/
 
+/*******************************************************************************
+* Function Name: static inline uint16_t le16(const uint8_t *p)
+				 static inline uint32_t le32(const uint8_t *p)
+				 bool DebugUart_TryReadPacket(void)
+				 static inline void wr16le(uint8_t *p, uint16_t v)
+				 static inline void wr32le(uint8_t *p, uint32_t v)
+				 void DebugUart_SendTxPacket(void)
+				 
+* That functions are your to transmit und recieve message between µC and Motorpanel
+*******************************************************************************/
+static inline uint16_t le16(const uint8_t *p)
+{
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static inline uint32_t le32(const uint8_t *p)
+{
+    return ((uint32_t)p[0])        |
+           ((uint32_t)p[1] << 8)  |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+bool DebugUart_TryReadPacket(void)
+{
+    enum { WAIT_START, READ_PAYLOAD };
+    static uint8_t state = WAIT_START;
+    static uint8_t payload[sizeof(rx_t)];
+    static uint8_t idx = 0;
+
+    while (Cy_SCB_UART_GetNumInRxFifo(DEBUG_UART_HW) != 0u)
+    {
+        uint8_t b = (uint8_t)Cy_SCB_UART_Get(DEBUG_UART_HW);
+
+        if (state == WAIT_START)
+        {
+            if (b == DBG_STARTBYTE)
+            {
+                idx = 0u;
+                state = READ_PAYLOAD;
+            }
+        }
+        else
+        {
+            payload[idx++] = b;
+
+            if (idx >= (uint8_t)sizeof(rx_t))
+            {
+                rx_t tmp;
+                tmp.target_speed  = (float32_t)le32(&payload[0])/1000.0;
+                tmp.target_iq     = (float32_t)le16(&payload[4])/1000.0;
+                tmp.control_mode  = payload[6];								//0 -> Block; 1 -> FOC
+                tmp.enable_motor  = payload[7];								//0 -> disable; 1 -> enable 
+                tmp.start         = payload[8];								//0 -> stop; 1 -> start
+                tmp.direction_cc  = payload[9];								//0 -> ccw; -> 1 -> cw
+                tmp.foc           = payload[10];							//0 -> block; 1 -> foc
+                tmp.sensorless    = payload[11];							//0 -> sensored; 1 -> sensorless
+
+                rxData = tmp;
+
+                state = WAIT_START;
+                return true; // Paket komplett, rxData aktualisiert
+            }
+        }
+    }
+
+    return false; // noch kein vollständiges Paket da
+}
+
+static inline void wr16le(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static inline void wr32le(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8)  & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+void DebugUart_SendTxPacket(void)
+{
+	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Message_Counter_HW, Message_Counter_NUM);
+	
+    uint8_t buf[1u + sizeof(tx_t)];
+    uint8_t i = 0u;
+
+    buf[i++] = DBG_STARTBYTE;
+
+    wr32le(&buf[i], txData.speed);        i += 4u;
+    wr16le(&buf[i], txData.torgue);       i += 2u;
+    wr16le(&buf[i], txData.i_bus);        i += 2u;
+    wr16le(&buf[i], txData.v_bus);        i += 2u;
+    wr16le(&buf[i], txData.pcb_temp);     i += 2u;
+    wr16le(&buf[i], txData.winding_temp); i += 2u;
+    wr16le(&buf[i], txData.id);           i += 2u;
+    wr16le(&buf[i], txData.iq);           i += 2u;
+    wr16le(&buf[i], txData.vd);           i += 2u;
+    wr16le(&buf[i], txData.vq);           i += 2u;
+
+    buf[i++] = txData.error;
+    buf[i++] = txData.warning;
+
+    // Senden (empfohlen, binär-sicher)
+    Cy_SCB_UART_PutArray(DEBUG_UART_HW, buf, (uint32_t)sizeof(buf));
+    
+    Cy_TCPWM_ClearInterrupt(Message_Counter_HW, Message_Counter_NUM, intrStatus);
+}
+/******************************************************************************/
+
 void Poti_read(void)
 {
 
     int32_t raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(12U);
-    we_ref = (float32_t)raw_value_idPot / 4095.0f * 6400.0;
-    
-    // Test:
-    PrintVars.we_ref = we_ref;
+    //we_ref = (float32_t)raw_value_idPot / 4095.0f * 1400.0 + 200.0;
+
     
     raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(10U);
 	// = (float32_t)raw_value_idPot / 4095.0f * 1000.0;
@@ -1986,6 +2147,12 @@ void init()
     
 	if (result != Cy_TCPWM_PWM_Init(SevSw_Counter_HW, SevSw_Counter_NUM, &SevSw_Counter_config)) { CY_ASSERT(0); }
     Cy_TCPWM_PWM_Enable(SevSw_Counter_HW, SevSw_Counter_NUM);
+    
+    /*for sending Messages to Motorpanel*/
+    if(result != Cy_TCPWM_Counter_Init(Message_Counter_HW,Message_Counter_NUM, &Message_Counter_config)) { CY_ASSERT(0); }
+    Cy_TCPWM_Counter_Enable(Message_Counter_HW, Message_Counter_NUM);
+    Cy_SysInt_Init(&Uart_intr_config, DebugUart_SendTxPacket);
+    //NVIC_EnableIRQ(Uart_intr_config.intrSrc);
 
     /* Halls & Button init*/
     Cy_GPIO_Pin_Init(HALL1_PORT, HALL1_PIN, &HALL1_config);
@@ -1998,6 +2165,9 @@ void init()
     
     /* Fan PWM Pin*/
     Cy_GPIO_Pin_Init(FAN_PWM_PORT, FAN_PWM_PIN, &FAN_PWM_config);
+    
+    /* Fan PWM Pin*/
+    Cy_GPIO_Pin_Init(ERROR_PORT, ERROR_PIN, &ERROR_config);
     
     Cy_GPIO_Pin_Init(SW1_PORT, SW1_NUM, &SW1_config);
     Cy_GPIO_Pin_Init(SW2_PORT, SW2_NUM, &SW2_config);
@@ -2026,8 +2196,7 @@ int main(void)
     /* Enable global interrupts */
     __enable_irq();
     
-    init();
-    static uint8_t sw1_prev = 0, sw2_prev = 0;
+    //static uint8_t sw1_prev = 0, sw2_prev = 0;
 	
     for (;;)
     {
@@ -2045,8 +2214,6 @@ int main(void)
 		SW1: --		
 		SW2: Stop
 		
-		*/
-		
 		uint8_t sw1 = (uint8_t)Cy_GPIO_Read(SW1_PORT, SW1_NUM);
 	    uint8_t sw2 = (uint8_t)Cy_GPIO_Read(SW2_PORT, SW2_NUM);
 	
@@ -2055,7 +2222,7 @@ int main(void)
 		
 		// --- READY: select mode + start ---
 	    if (system_state == SYSTEM_READY)
-	    {
+	    {	
 	        if (sw1_rise)
 	        {
 	            system_req = START_FOC;
@@ -2097,19 +2264,28 @@ int main(void)
 	
 	    sw1_prev = sw1;
 	    sw2_prev = sw2;
-	
+		*/
 	    // FSM progresses here
 	    system_fsm_step();
-				
-		/* UART */
-        char print_Array[37];
-        float32_t data_Array[9] = {PrintVars.Duty*100.0, PrintVars.ibus, PrintVars.vbus, PrintVars.id, PrintVars.iq, PrintVars.we, PrintVars.we_hall, PrintVars.we_ref, PrintVars.we_smo};
-        print_Array[0] = 0xAA;
-        memcpy(&print_Array[1], data_Array, sizeof(data_Array));
-        for (int i = 0; i < (int)sizeof(print_Array); i++) 
-        { 
-			printf("%c", print_Array[i]); 
+	    
+	    DebugUart_TryReadPacket();
+	    
+	    if (system_state == SYSTEM_OFF && rxData.enable_motor == 1U) init();
+	    
+	    if (system_state == SYSTEM_READY && rxData.start == 1U)
+	    {
+			if(rxData.control_mode == 0U) system_req = START_BLOCK;
+			else if (rxData.control_mode == 1U) system_req = START_FOC;
 		}
+		if (system_state == SYSTEM_READY && rxData.start == 0U) low_sides_all_on();
+		if ((rxData.start == 0U || rxData.enable_motor == 0U) && system_state == SYSTEM_RUN_FOC) system_req = STOP_FOC;
+		if ((rxData.start == 0U || rxData.enable_motor == 0U) && system_state == SYSTEM_RUN_BLOCK) system_req = STOP_BLOCK;
+		if(system_state == SYSTEM_RUN_FOC)
+		{
+			if(rxData.sensorless == 0U && foc_type == FOC_SENSORLESS) foc_switch_ctrl_methode();
+			else if(rxData.sensorless == 1U && foc_type == FOC_SENSORLESS) foc_switch_ctrl_methode(); 
+		}
+		
     }
 }
 
