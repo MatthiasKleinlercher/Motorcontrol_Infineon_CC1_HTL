@@ -248,7 +248,7 @@ enum {
 typedef struct
 {
 	float32_t target_speed; //[U/min]
-	float32_t target_iq;	   // [A]
+	float32_t target_torque;	   // [Nm]
 	uint8_t control_mode;
 	uint8_t enable_motor;
 	uint8_t start;
@@ -269,8 +269,8 @@ typedef struct
 	uint16_t iq; //[mA]
 	uint16_t vd; //[mV]
 	uint16_t vq; //[mV]
-	uint8_t error;
-	uint8_t warning;
+	uint8_t signal;
+
 }tx_t;
 
 
@@ -361,6 +361,8 @@ typedef enum {	SWITCH_CTRL_METHODE,
 				START_BLOCK,
 				STOP_FOC,
 				STOP_BLOCK,
+				ENABLE,
+				DISABLE,
 				NO_REQ }system_req_t;
 volatile system_req_t system_req = NO_REQ;
 
@@ -474,6 +476,8 @@ bool DebugUart_TryReadPacket(void);
 static inline void wr16le(uint8_t *p, uint16_t v);
 static inline void wr32le(uint8_t *p, uint32_t v);
 void DebugUart_SendTxPacket(void);
+void sevSw_on();
+void sevSw_off();
 /*******************************************************************************
 * Function Definitions
 *******************************************************************************/
@@ -1231,7 +1235,7 @@ void controller_counter_intr_handler()
 	//TODO: Test
 	PrintVars.we_ref = we_ref;
 	
-	float32_t iq_ref = rxData.target_iq;
+	float32_t iq_ref = rxData.target_torque*12.0;
 	we_ref = _sat(we_ref, 0.1, 30.0);
 	
 	// =========================
@@ -1927,6 +1931,28 @@ void calibration_init()
 /******************************************************************************/
 
 /*******************************************************************************
+* Function Name: void sevSw_on()
+				 void sevSw_off()
+
+* Enables/disables half bridge
+*******************************************************************************/
+void sevSw_on()
+{
+	uint32_t SevSw_PeriodVal = Cy_TCPWM_PWM_GetPeriod0(SevSw_Counter_HW, SevSw_Counter_NUM);
+	Cy_TCPWM_PWM_SetCompare0Val(SevSw_Counter_HW, SevSw_Counter_NUM, SevSw_PeriodVal);
+	
+	Cy_TCPWM_TriggerStart_Single(SevSw_Counter_HW, SevSw_Counter_NUM);
+}
+
+void sevSw_off()
+{
+	Cy_TCPWM_PWM_SetCompare0Val(SevSw_Counter_HW, SevSw_Counter_NUM, 0);
+	
+	Cy_TCPWM_TriggerStart_Single(SevSw_Counter_HW, SevSw_Counter_NUM);
+}
+/******************************************************************************/
+
+/*******************************************************************************
 * Function Name: static void system_fsm_step()
 
 
@@ -1957,6 +1983,16 @@ static void system_fsm_step()
 		system_state = SYSTEM_SHUTDOWN_BLOCK_CMD;
 		system_req = NO_REQ;
 	}
+	else if(system_req == ENABLE)
+	{
+		sevSw_on();
+		system_req = NO_REQ;
+	}
+	else if(system_req == DISABLE)
+	{
+		sevSw_off();
+		system_req = NO_REQ;
+	}
 
 	
 }
@@ -1977,58 +2013,108 @@ static inline uint16_t le16(const uint8_t *p)
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
-static inline uint32_t le32(const uint8_t *p)
-{
-    return ((uint32_t)p[0])        |
-           ((uint32_t)p[1] << 8)  |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
-
 bool DebugUart_TryReadPacket(void)
 {
-    enum { WAIT_START, READ_PAYLOAD };
-    static uint8_t state = WAIT_START;
-    static uint8_t payload[sizeof(rx_t)];
-    static uint8_t idx = 0;
+    typedef enum
+    {
+        RX_WAIT_CMD = 0,
+        RX_READ_DATA
+    } rx_parse_state_t;
+
+    static rx_parse_state_t state = RX_WAIT_CMD;
+    static uint8_t cmd = 0u;
+    static uint8_t payload[2];
+    static uint8_t idx = 0u;
+    static uint8_t expected_len = 0u;
+
+    bool updated = false;
 
     while (Cy_SCB_UART_GetNumInRxFifo(DEBUG_UART_HW) != 0u)
     {
         uint8_t b = (uint8_t)Cy_SCB_UART_Get(DEBUG_UART_HW);
 
-        if (state == WAIT_START)
+        if (state == RX_WAIT_CMD)
         {
-            if (b == DBG_STARTBYTE)
+            cmd = b;
+            idx = 0u;
+
+            switch (cmd)
             {
-                idx = 0u;
-                state = READ_PAYLOAD;
+                case 0xA0:  // speed -> 16 Bit
+                    expected_len = 2u;
+                    state = RX_READ_DATA;
+                    break;
+                    
+                case 0xA1:  // torque -> 8 Bit
+                    expected_len = 1u;
+                    state = RX_READ_DATA;
+                    break;
+
+                case 0xAA:  // packed flags -> 8 Bit
+                    expected_len = 1u;
+                    state = RX_READ_DATA;
+                    break;
+
+                default:
+                    // unbekanntes Startbyte ignorieren
+                    state = RX_WAIT_CMD;
+                    break;
             }
         }
-        else
+        else // RX_READ_DATA
         {
             payload[idx++] = b;
 
-            if (idx >= (uint8_t)sizeof(rx_t))
+            if (idx >= expected_len)
             {
-                rx_t tmp;
-                tmp.target_speed  = (float32_t)le32(&payload[0])/1000.0;
-                tmp.target_iq     = (float32_t)le16(&payload[4])/1000.0;
-                tmp.control_mode  = payload[6];								//0 -> Block; 1 -> FOC
-                tmp.enable_motor  = payload[7];								//0 -> disable; 1 -> enable 
-                tmp.start         = payload[8];								//0 -> stop; 1 -> start
-                tmp.direction_cc  = payload[9];								//0 -> ccw; -> 1 -> cw
-                tmp.foc           = payload[10];							//0 -> block; 1 -> foc
-                tmp.sensorless    = payload[11];							//0 -> sensored; 1 -> sensorless
+                switch (cmd)
+                {
+                    case 0xA0:
+                        rxData.target_speed = (float32_t)(le16(payload))/10.0;
+                        updated = true;
+                        
+                        break;
 
-                rxData = tmp;
+                    case 0xA1:
+					    rxData.target_torque = (float32_t)(payload[0]) / 100.0f;
+					    updated = true;
+					    break;
 
-                state = WAIT_START;
-                return true; // Paket komplett, rxData aktualisiert
+                    case 0xAA:
+                    {
+                        uint8_t flags = payload[0];
+
+                        // bit0 = ControlMode (1 = speed, 0 = torque)
+                        // bit1 = EnableMotor
+                        // bit2 = StartStop
+                        // bit3 = Direction
+                        // bit4 = FOC/Block
+                        // bit5 = SensorMode
+                        // bit6..7 reserved
+
+                        rxData.control_mode = (flags & (1u << 0)) ? 1u : 0u;
+                        rxData.enable_motor = (flags & (1u << 1)) ? 1u : 0u;
+                        rxData.start        = (flags & (1u << 2)) ? 1u : 0u;
+                        rxData.direction_cc = (flags & (1u << 3)) ? 1u : 0u;
+                        rxData.foc          = (flags & (1u << 4)) ? 1u : 0u;
+                        rxData.sensorless   = (flags & (1u << 5)) ? 1u : 0u;
+						
+                        updated = true;
+                    }
+                    break;
+
+                    default:
+                        break;
+                }
+
+                // für nächstes Telegramm zurücksetzen
+                state = RX_WAIT_CMD;
+                idx = 0u;
+                expected_len = 0u;
             }
         }
     }
-
-    return false; // noch kein vollständiges Paket da
+    return updated;
 }
 
 static inline void wr16le(uint8_t *p, uint16_t v)
@@ -2037,41 +2123,29 @@ static inline void wr16le(uint8_t *p, uint16_t v)
     p[1] = (uint8_t)(v >> 8);
 }
 
-static inline void wr32le(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v & 0xFFu);
-    p[1] = (uint8_t)((v >> 8)  & 0xFFu);
-    p[2] = (uint8_t)((v >> 16) & 0xFFu);
-    p[3] = (uint8_t)((v >> 24) & 0xFFu);
-}
-
 void DebugUart_SendTxPacket(void)
 {
-	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Message_Counter_HW, Message_Counter_NUM);
-	
-    uint8_t buf[1u + sizeof(tx_t)];
+	const uint8_t TX_PAYLOAD_LEN = 20U;
+
+    uint8_t buf[1u + TX_PAYLOAD_LEN];
     uint8_t i = 0u;
 
     buf[i++] = DBG_STARTBYTE;
 
-    wr32le(&buf[i], txData.speed);        i += 4u;
-    wr16le(&buf[i], txData.torgue);       i += 2u;
-    wr16le(&buf[i], txData.i_bus);        i += 2u;
-    wr16le(&buf[i], txData.v_bus);        i += 2u;
-    wr16le(&buf[i], txData.pcb_temp);     i += 2u;
-    wr16le(&buf[i], txData.winding_temp); i += 2u;
-    wr16le(&buf[i], txData.id);           i += 2u;
-    wr16le(&buf[i], txData.iq);           i += 2u;
-    wr16le(&buf[i], txData.vd);           i += 2u;
-    wr16le(&buf[i], txData.vq);           i += 2u;
+    wr16le(&buf[i], txData.speed);        i += 2u;   // uint16_t
+    buf[i++] = txData.torgue;                       // uint8_t
+    wr16le(&buf[i], txData.i_bus);        i += 2u;   // uint16_t
+    wr16le(&buf[i], txData.v_bus);        i += 2u;   // uint16_t
+    wr16le(&buf[i], txData.pcb_temp);     i += 2u;   // uint16_t
+    wr16le(&buf[i], txData.winding_temp); i += 2u;   // uint16_t
+    wr16le(&buf[i], txData.id);           i += 2u;   // uint16_t
+    wr16le(&buf[i], txData.iq);           i += 2u;   // uint16_t
+    wr16le(&buf[i], txData.vd);           i += 2u;   // uint16_t
+    wr16le(&buf[i], txData.vq);           i += 2u;   // uint16_t
 
-    buf[i++] = txData.error;
-    buf[i++] = txData.warning;
+    buf[i++] = txData.signal;                       // uint8_t
 
-    // Senden (empfohlen, binär-sicher)
-    Cy_SCB_UART_PutArray(DEBUG_UART_HW, buf, (uint32_t)sizeof(buf));
-    
-    Cy_TCPWM_ClearInterrupt(Message_Counter_HW, Message_Counter_NUM, intrStatus);
+    Cy_SCB_UART_PutArray(DEBUG_UART_HW, buf, i);
 }
 /******************************************************************************/
 
@@ -2195,7 +2269,7 @@ int main(void)
 
     /* Enable global interrupts */
     __enable_irq();
-    
+    init();
     //static uint8_t sw1_prev = 0, sw2_prev = 0;
 	
     for (;;)
@@ -2269,22 +2343,8 @@ int main(void)
 	    system_fsm_step();
 	    
 	    DebugUart_TryReadPacket();
+	    DebugUart_SendTxPacket();
 	    
-	    if (system_state == SYSTEM_OFF && rxData.enable_motor == 1U) init();
-	    
-	    if (system_state == SYSTEM_READY && rxData.start == 1U)
-	    {
-			if(rxData.control_mode == 0U) system_req = START_BLOCK;
-			else if (rxData.control_mode == 1U) system_req = START_FOC;
-		}
-		if (system_state == SYSTEM_READY && rxData.start == 0U) low_sides_all_on();
-		if ((rxData.start == 0U || rxData.enable_motor == 0U) && system_state == SYSTEM_RUN_FOC) system_req = STOP_FOC;
-		if ((rxData.start == 0U || rxData.enable_motor == 0U) && system_state == SYSTEM_RUN_BLOCK) system_req = STOP_BLOCK;
-		if(system_state == SYSTEM_RUN_FOC)
-		{
-			if(rxData.sensorless == 0U && foc_type == FOC_SENSORLESS) foc_switch_ctrl_methode();
-			else if(rxData.sensorless == 1U && foc_type == FOC_SENSORLESS) foc_switch_ctrl_methode(); 
-		}
 		
     }
 }
