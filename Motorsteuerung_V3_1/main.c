@@ -15,14 +15,17 @@
 #include "cycfg_peripherals.h"
 #include "cycfg_pins.h"
 #include "cyip_flashc.h"
+#include "cyip_hppass.h"
 #include "gpio_psc3_e_lqfp_80.h"
 #include "mtb_hal.h"
 #include "cybsp.h"
 #include "psc3m5fds2afq1_s.h"
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <cy_retarget_io.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "cy_gpio.h"
 #include "cy_hppass.h"
@@ -74,26 +77,6 @@
 /*******************************************************************************
 * defines
 *******************************************************************************/
-
-// ADC - Channels
-#define ADC_CH_IMS_U		0U
-#define ADC_CH_IMS_V  	 	1U
-#define ADC_CH_IMS_W   		2U
-#define ADC_CH_IMS_DCBUS	3U
-#define ADC_CH_VMS_U		4U
-#define ADC_CH_VMS_V		5U
-#define ADC_CH_VMS_W		6U
-#define ADC_CH_VMS_DCBUS	7U
-
-// ADC
-#define VM_IU  (1u<<0)
-#define VM_IV  (1u<<1)
-#define VM_IW  (1u<<2)
-#define VM_IDC (1u<<3)
-#define VM_VU  (1u<<4)
-#define VM_VV  (1u<<5)
-#define VM_VW  (1u<<6)
-#define VM_VDC (1u<<7)
 
 // ADC calibartion type
 typedef struct
@@ -259,34 +242,54 @@ typedef struct
 
 typedef struct
 {
-	uint32_t speed;		//[mU/min]
-	uint16_t torgue;	//[mNm]
-	uint16_t i_bus;		//[mA]
-	uint16_t v_bus;		//[mV]
-	uint16_t pcb_temp;	//[m°C]
-	uint16_t winding_temp; //[m°C]
-	uint16_t id; //[mA]
-	uint16_t iq; //[mA]
-	uint16_t vd; //[mV]
-	uint16_t vq; //[mV]
-	uint8_t signal;
+    uint16_t speed;         // speed *10
+    uint8_t  torgue;        // torque *100 (aus iq/12)
 
-}tx_t;
+    uint16_t i_bus;         // value *10
+    uint16_t v_bus;         // value *10
+    uint16_t pcb_temp;      // value *10  (noch nicht vorhanden -> 0)
+    uint16_t winding_temp;  // value *10  (noch nicht vorhanden -> 0)
+    uint16_t id;            // value *10
+    uint16_t iq;            // value *10
+    uint16_t vd;            // value *10
+    uint16_t vq;            // value *10
 
+    uint8_t  signal;        // bit0=error, bit1=warning
+} tx_t;
+
+
+// motor suite gui
+typedef struct
+{
+    volatile uint8_t drive_enable;
+    volatile int8_t  direction_cmd;     // +1 / -1
+    volatile float   speed_ref_rpm;
+    volatile uint8_t estop;
+
+    volatile uint16_t state;
+    volatile float speed_meas_rpm;
+    volatile float id_meas;
+    volatile float iq_meas;
+    volatile float ia;
+    volatile float ib;
+    volatile float ic;
+} motor_gui_if_t;
+
+motor_gui_if_t g_gui = {0};
 
 // Params for pre alignment
-#define M_COARSE              (0.1f)
-#define M_FINE                (0.1f)
-#define M_POL                 (0.1f)
+#define M_COARSE              (0.002f)
+#define M_FINE                (0.003f)
+#define M_POL                 (0.004f)
 
-#define INJ_ON_CYCLES_COARSE  (3)
-#define INJ_OFF_CYCLES_COARSE (12)
+#define INJ_ON_CYCLES_COARSE  (300)
+#define INJ_OFF_CYCLES_COARSE (400)
 
-#define INJ_ON_CYCLES_FINE    (4)
-#define INJ_OFF_CYCLES_FINE   (16)
+#define INJ_ON_CYCLES_FINE    (300)
+#define INJ_OFF_CYCLES_FINE   (400)
 
-#define INJ_ON_CYCLES_POL     (8)
-#define INJ_OFF_CYCLES_POL    (32)
+#define INJ_ON_CYCLES_POL     (300)
+#define INJ_OFF_CYCLES_POL    (400)
 
 // Values
 #define TWO_PI          6.2831853072f
@@ -317,7 +320,10 @@ typedef struct
 #define CONTROLLER_INTERRUPT_TIME 0.00016  // 160 µs
 
 // Voltage supoply
-#define VDD 36.0
+#define VDD 36.0f
+
+// Rated Current
+#define Ir 35.0f
 
 //Communication
 #define DBG_STARTBYTE   (0xAAu)
@@ -332,10 +338,13 @@ typedef struct
 	float32_t id;
 	float32_t iq;
 	float32_t we_ref;
-	float32_t Duty;
 	float32_t we;
 	float32_t we_hall;
-	float32_t we_smo;
+	float32_t we_OBS;
+	float32_t vd;
+	float32_t vq;
+	float32_t iq_ref;
+	float32_t Duty;
 }Print_t;
 /*******************************************************************************
 * Macros
@@ -347,16 +356,26 @@ typedef struct
 *******************************************************************************/
 
 // ===== Control selection / FSM requests =====
-typedef enum {	SYSTEM_OFF, SYSTEM_INIT, SYSTEM_CALIBRATION, SYSTEM_READY, 
+typedef enum {	SYSTEM_OFF, SYSTEM_INIT, SYSTEM_ENABLE, SYSTEM_READY, 
 				SYSTEM_STARTUP_FOC_PREALIGN, SYSTEM_STARTUP_FOC_OPENLOOP, SYSTEM_RUN_FOC, SYSTEM_SHUTDOWN_FOC_CMD, SYSTEM_SHUTDOWN_FOC,
 				SYSTEM_STARTUP_BLOCK, SYSTEM_RUN_BLOCK, SYSTEM_SHUTDOWN_BLOCK_CMD, SYSTEM_SHUTDOWN_BLOCK, 
-				SYSTEM_FAULT} system_state_t;
-volatile system_state_t system_state = SYSTEM_OFF;
+				SYSTEM_DISABLE, SYSTEM_FAULT} system_state_t;
+volatile system_state_t system_state = SYSTEM_INIT;
 
 typedef enum {	FOC_SENSORED, FOC_SENSORLESS} foc_type_t;
-volatile foc_type_t foc_type = FOC_SENSORLESS;
+volatile foc_type_t foc_type = FOC_SENSORED;
 
-typedef enum {	SWITCH_CTRL_METHODE,
+typedef enum {	FOC_IQ_CONTROLLED, FOC_SPEED_CONTROLLED} foc_controller_type_t;
+volatile foc_controller_type_t foc_controller_type = FOC_SPEED_CONTROLLED;
+
+volatile bool counterClockwise = 0U; //CCW = true; CW = false;
+volatile float32_t We_ref = 0.0f;
+volatile float32_t Iq_ref = 0.0f;
+
+typedef enum {	ENABLE_SYSTEM,
+				DISABLE_SYSTEM,
+				SWITCH_CTRL_METHODE,
+				SWITCH_CONTROLLER_METHODE,
 				START_FOC,
 				START_BLOCK,
 				STOP_FOC,
@@ -400,34 +419,28 @@ volatile float32_t last_imag = 0.0f;       // ADC-ISR writes values in Peak
 // Hall measurement
 static hall_meas_t hall_values = {};
 
-// Block pi controller
-static PI_t g_pi_block_speed;
-
 // Communication
 volatile rx_t rxData;
 volatile tx_t txData;
+static rx_t rxPrev = {0};
 
 // Test Vars
 volatile Print_t PrintVars;
+float32_t alpha = 0.0;
 /*******************************************************************************
 * Functions
 *******************************************************************************/
+void enable();
+void disable();
 void init();
-void calibration_init();
 void pass_0_sar_0_fifo_0_buffer_0_callback();
 void pwm_reload_intr_handler();
 void controller_counter_intr_handler();
 void speed_measurment_intr_handler();
 void adc_calibration_start_lowside_clamp(uint32_t target_samples, uint32_t warmup_samples);
-static inline bool _cal_all_done(adc_cal_ls_clamp_t *c);
 void adc_calibration_feed_lowside_clamp(const int16_t *data, const uint8_t *chan, uint8_t n);
-static inline int16_t _adc_apply_offset(int16_t raw, int16_t off);
 void low_sides_all_on(void);
 void high_sides_all_on(void);
-static inline float32_t _adc_to_amp_i16(int16_t adc_raw, int16_t adc_off, float32_t k);
-static inline float32_t _adc_to_volt_i16(int16_t adc_raw, int16_t adc_off, float32_t k, float32_t b);
-static inline adc_frame_t _adc_unpack_frame(const int16_t *data, const uint8_t *chan, uint8_t n);
-static inline bool _adc_frame_to_si(const adc_frame_t *f, volatile meas_si_t *out);
 static inline void _clarke_ab(float32_t ia, float32_t ib, float32_t ic, float32_t *alpha, float32_t *beta);
 static inline void _park_dq(float32_t alpha, float32_t beta, float32_t s, float32_t c, float32_t *d, float32_t *q);
 static inline void _inv_park_ab(float32_t d, float32_t q, float32_t s, float32_t c, float32_t *alpha, float32_t *beta);
@@ -458,26 +471,24 @@ void Poti_read(void);
 void safety_intr_handler();
 static inline void _pwm_all_enable();
 static inline void _pwm_all_disable();
-static inline void _motor_outputs_stop_now();
 uint8_t read_hall_state(void);
-inline int8_t _get_direction(uint8_t lut_idx, uint8_t prev_lut_idx);
-inline float32_t _get_correct_theta(uint8_t lut_idx, uint8_t prev_lut_idx);
+static inline int8_t _get_direction(uint8_t lut_idx, uint8_t prev_lut_idx);
+static inline float32_t _get_correct_theta(uint8_t lut_idx, uint8_t prev_lut_idx);
 void hall_interrupt_handler(void);
 static inline float32_t _HALL_get_theta(const hall_meas_t* h);
 static inline float32_t _HALL_get_we(hall_meas_t* hall);
 static void init_pi_block_speed(PI_t *s);
-static inline float32_t block_get_duty_from_speed(float32_t we_ref_cmd, float32_t we_meas);
 static void system_fsm_step();
 static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_math_pos);
 static inline void foc_switch_ctrl_methode();
 static inline uint16_t le16(const uint8_t *p);
-static inline uint32_t le32(const uint8_t *p);
 bool DebugUart_TryReadPacket(void);
 static inline void wr16le(uint8_t *p, uint16_t v);
-static inline void wr32le(uint8_t *p, uint32_t v);
 void DebugUart_SendTxPacket(void);
 void sevSw_on();
 void sevSw_off();
+static inline bool _is_foc_group(system_state_t st);
+static inline bool _is_block_group(system_state_t st);
 /*******************************************************************************
 * Function Definitions
 *******************************************************************************/
@@ -497,6 +508,29 @@ void sevSw_off();
 *  int
 *
 *******************************************************************************/
+
+/*******************************************************************************
+* Function Name: static inline float32_t _dir_sign_f(void)
+				 static inline bool _is_foc_group(system_state_t st)
+				 static inline bool _is_block_group(system_state_t st)
+
+* Helpers: State groups
+*******************************************************************************/
+
+
+static inline bool _is_foc_group(system_state_t st)
+{
+    return (st == SYSTEM_STARTUP_FOC_PREALIGN) || (st == SYSTEM_STARTUP_FOC_OPENLOOP) ||
+           (st == SYSTEM_RUN_FOC) || (st == SYSTEM_SHUTDOWN_FOC_CMD) || (st == SYSTEM_SHUTDOWN_FOC);
+}
+
+static inline bool _is_block_group(system_state_t st)
+{
+    return (st == SYSTEM_STARTUP_BLOCK) || (st == SYSTEM_RUN_BLOCK) ||
+           (st == SYSTEM_SHUTDOWN_BLOCK_CMD) || (st == SYSTEM_SHUTDOWN_BLOCK);
+}
+
+/******************************************************************************/
 
 /*******************************************************************************
 * Function Name: static inline void _pwm_all_enable()
@@ -532,21 +566,6 @@ static inline void _pwm_all_disable()
     Cy_TCPWM_PWM_Disable(PWM_Counter_U_HW, PWM_Counter_U_NUM);
     Cy_TCPWM_PWM_Disable(PWM_Counter_V_HW, PWM_Counter_V_NUM);
     Cy_TCPWM_PWM_Disable(PWM_Counter_W_HW, PWM_Counter_W_NUM);
-}
-
-/******************************************************************************/
-
-/*******************************************************************************
-* Function Name: static inline void _motor_outputs_stop_now()
-
-* Stops the motor
-*******************************************************************************/
-
-static inline void _motor_outputs_stop_now()
-{
-
-    _pwm_all_enable();
-    low_sides_all_on();
 }
 
 /******************************************************************************/
@@ -677,28 +696,12 @@ static inline void _svpwm(float32_t Va, float32_t Vb, float32_t Vc, float32_t ov
 /******************************************************************************/
 
 /*******************************************************************************
-* Function Name: static inline void _svpwm()
+* Function Name: static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_math_pos)
 
 * -
 *******************************************************************************/
-/* TODO: Has to be documented */
 
-static void block_start(void)
-{   
-    init_pi_block_speed(&g_pi_block_speed);
-    
-    _pwm_all_enable();
-    NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
-    Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
-}
-
-static inline float32_t block_get_duty_from_speed(float32_t we_ref_cmd, float32_t we_meas)
-{
-    float32_t duty = _pi_controller_step(&g_pi_block_speed, we_ref_cmd, fabsf(we_meas));
-    return _sat(duty, 0.0f, 0.95f);
-}
-
-static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_math_pos)
+static inline void _Block(float32_t Duty, uint8_t lut_idx, bool CounterClockwise)
 {	
 	/*TODO: Check if Arrays are correct for clock and countclockwise*/
 	static int16_t lut[LUT_SIZE][3] =
@@ -721,7 +724,7 @@ static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_mat
 		{HIGH, LOW,  OFF}
 	};
 	
-	if (direction_is_math_pos == true)
+	if (CounterClockwise == true)
 	{
 		set_PWM(PWM_Counter_U_HW, PWM_Counter_U_NUM, A, cclut, lut_idx, Duty);
 		set_PWM(PWM_Counter_V_HW, PWM_Counter_V_NUM, B, cclut, lut_idx, Duty);
@@ -898,7 +901,7 @@ void safety_intr_handler()
 {
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Safety_Counter_HW, Safety_Counter_NUM);
 	
-    system_state = SYSTEM_FAULT;
+    //system_state = SYSTEM_FAULT;
 	
 	Cy_TCPWM_ClearInterrupt(Safety_Counter_HW, Safety_Counter_NUM, intrStatus);
 }
@@ -1002,9 +1005,6 @@ static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, fl
     float32_t omega_limited = fminf(fmaxf(omega_u, -OMEGA_MAX), OMEGA_MAX);
     smo->omega_hat = omega_limited;
     
-    // Test:
-    PrintVars.we_smo = omega_limited;
-    
     // Back-calculation (k_aw ≈ ω_n)
     const float k_aw = 2.0f * 3.14159265f * 15.0f;
     smo->integ_e += (smo->Ki_pll * e_theta + (omega_limited - omega_u) * k_aw) * smo->Ts;
@@ -1013,7 +1013,8 @@ static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, fl
     smo->theta_rad = _wrap_pi(smo->theta_hat + smo->theta_shift);
 
     // w-Glättung (für Anzeige)
-    smo->omega_hat_f += smo->alpha_omega * (smo->omega_hat - smo->omega_hat_f);
+    smo->omega_hat_f += alpha*(smo->omega_hat - smo->omega_hat_f);//smo->alpha_omega * (smo->omega_hat - smo->omega_hat_f);
+	PrintVars.we_OBS = smo->omega_hat_f;
 	
     smo->i_alpha_prev = iAlpha;
     smo->i_beta_prev  = iBeta;
@@ -1021,7 +1022,7 @@ static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, fl
 
 
 static inline float32_t _SMO_GetTheta(const smo_t* smo){ return smo->theta_rad; }
-static inline float32_t _SMO_GetOmega(const smo_t* smo){ return smo->omega_hat; }
+static inline float32_t _SMO_GetOmega(const smo_t* smo){ return smo->omega_hat_f; }
 static inline float32_t _SMO_GetSpeed(const smo_t* smo){ return (smo->omega_hat / (TWO_PI * smo->p)) * 60.0f;}
 /******************************************************************************/
 
@@ -1073,22 +1074,22 @@ uint8_t read_hall_state(void)
     return (H1 << 2) | (H2 << 1) | H3;
 }
 
-inline int8_t _get_direction(uint8_t lut_idx, uint8_t prev_lut_idx)
+static inline int8_t _get_direction(uint8_t lut_idx, uint8_t prev_lut_idx)
 {
-	if 		((int8_t)lut_idx - (int8_t)prev_lut_idx == 1 || (int8_t)lut_idx - (int8_t)prev_lut_idx == -5) return 1;
-	else if ((int8_t)lut_idx - (int8_t)prev_lut_idx == -1 || (int8_t)lut_idx - (int8_t)prev_lut_idx == 5) return -1;
-	else return 0;
+    if (((int8_t)lut_idx - (int8_t)prev_lut_idx == 1) || ((int8_t)lut_idx - (int8_t)prev_lut_idx == -5)) return 1;
+    else if (((int8_t)lut_idx - (int8_t)prev_lut_idx == -1) || ((int8_t)lut_idx - (int8_t)prev_lut_idx == 5)) return -1;
+    else return 0;
 }
 
-inline float32_t _get_correct_theta(uint8_t lut_idx, uint8_t prev_lut_idx)
+static inline float32_t _get_correct_theta(uint8_t lut_idx, uint8_t prev_lut_idx)
 {
-	if ((lut_idx == 1 && prev_lut_idx == 0) || (lut_idx == 0 && prev_lut_idx == 1)) return lut_to_theta[0];
-	else if ((lut_idx == 2 && prev_lut_idx == 1) || (lut_idx == 1 && prev_lut_idx == 2)) return lut_to_theta[1];
-	else if ((lut_idx == 3 && prev_lut_idx == 2) || (lut_idx == 2 && prev_lut_idx == 3)) return lut_to_theta[2];
-	else if ((lut_idx == 4 && prev_lut_idx == 3) || (lut_idx == 3 && prev_lut_idx == 4)) return lut_to_theta[3];
-	else if ((lut_idx == 5 && prev_lut_idx == 4) || (lut_idx == 4 && prev_lut_idx == 5)) return lut_to_theta[4];
-	else if ((lut_idx == 0 && prev_lut_idx == 5) || (lut_idx == 5 && prev_lut_idx == 0)) return lut_to_theta[5];
-	else return 0.0;
+    if ((lut_idx == 1 && prev_lut_idx == 0) || (lut_idx == 0 && prev_lut_idx == 1)) return lut_to_theta[0];
+    else if ((lut_idx == 2 && prev_lut_idx == 1) || (lut_idx == 1 && prev_lut_idx == 2)) return lut_to_theta[1];
+    else if ((lut_idx == 3 && prev_lut_idx == 2) || (lut_idx == 2 && prev_lut_idx == 3)) return lut_to_theta[2];
+    else if ((lut_idx == 4 && prev_lut_idx == 3) || (lut_idx == 3 && prev_lut_idx == 4)) return lut_to_theta[3];
+    else if ((lut_idx == 5 && prev_lut_idx == 4) || (lut_idx == 4 && prev_lut_idx == 5)) return lut_to_theta[4];
+    else if ((lut_idx == 0 && prev_lut_idx == 5) || (lut_idx == 5 && prev_lut_idx == 0)) return lut_to_theta[5];
+    else return 0.0f;
 }
 
 
@@ -1105,12 +1106,13 @@ void hall_interrupt_handler(void)
     }
 	
 	
-	hall_values.lut_idx = lut_index;
-	//hall_values.direction = _get_direction(lut_index, hall_values.prev_lut_idx);
+	hall_values.lut_idx    = lut_index;
+	hall_values.direction  = _get_direction(lut_index, hall_values.prev_lut_idx);
 	hall_values.theta_sector = lut_to_theta_sector[lut_index];
-	//hall_values.correct_theta = _get_correct_theta(lut_index, hall_values.prev_lut_idx);
-	if (hall_values.correct_theta != 0.0f) hall_values.correct_angle_set = true;
-	else hall_values.correct_angle_set = false;
+	
+	hall_values.correct_theta = _get_correct_theta(lut_index, hall_values.prev_lut_idx);
+	hall_values.correct_angle_set = (hall_values.correct_theta != 0.0f);
+	
 	hall_values.prev_lut_idx = lut_index;
 	
 	if (Cy_TCPWM_Counter_GetStatus(Safety_Counter_HW, Safety_Counter_NUM) & CY_TCPWM_COUNTER_STATUS_COUNTER_RUNNING)
@@ -1130,13 +1132,8 @@ void hall_interrupt_handler(void)
             {
                 float32_t timePerHall = (float32_t)diff_count / (float32_t)SysFreq;
                 float32_t we_mag = TWO_PI / (timePerHall * (float32_t)LUT_SIZE);
-
-                int8_t dir = hall_values.direction;
-                if (dir == 0) dir = +1;
-                hall_values.we_hall = (float32_t)dir * we_mag;
-                
-                // Test:
-                PrintVars.we_hall = hall_values.we_hall;
+                hall_values.we_hall = we_mag;
+                PrintVars.we_hall = we_mag;
             }
             hall_values.prev_Count = count;
         }
@@ -1207,12 +1204,13 @@ static inline float32_t _pi_controller_step(PI_t *c, float32_t setpoint, float32
 *******************************************************************************/
 static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we)
 {
-	const float32_t vq_boost = 1.0;
-	const float32_t we_ramp = 0.008; //[V/rad/s]
+	const float32_t vq_boost = 4.5;
+	const float32_t we_ramp = 0.0009; //[V/rad/s]
 	
 	*vd = 0.0;
 	*vq = vq_boost + we_ramp * we;
-	if (*vq < 0.0) *vq = 0.0;
+	if (counterClockwise == true) *vq = -*vq;
+	if (fabsf(*vq) < 0.0) *vq = 0.0;
 }
 /******************************************************************************/
 
@@ -1230,13 +1228,7 @@ void controller_counter_intr_handler()
 	const float32_t OL_DUTY = 0.2;
 	const float32_t CALL_TIME = CONTROLLER_INTERRUPT_TIME;
 	
-	float32_t we_ref = rxData.target_speed/60.0 * 4.0;
-	we_ref = _sat(we_ref, 200.0, 1675.0);
-	//TODO: Test
-	PrintVars.we_ref = we_ref;
-	
-	float32_t iq_ref = rxData.target_torque*12.0;
-	we_ref = _sat(we_ref, 0.1, 30.0);
+	float32_t we_ref = _sat(We_ref, 200.0f, 628.0f);
 	
 	// =========================
     // BLOCK
@@ -1244,39 +1236,51 @@ void controller_counter_intr_handler()
 	
 	if (system_state == SYSTEM_STARTUP_BLOCK || system_state == SYSTEM_RUN_BLOCK || system_state == SYSTEM_SHUTDOWN_BLOCK_CMD || system_state == SYSTEM_SHUTDOWN_BLOCK)
 	{
+		static PI_t c;
 		static float32_t duty = 0.0;
-		float32_t we_m = 0.0;
+		static float32_t we_m = 0.0;
+		if(system_state != SYSTEM_STARTUP_BLOCK && system_state == SYSTEM_SHUTDOWN_BLOCK) we_m = _HALL_get_we(&hall_values);
 		if (system_state == SYSTEM_STARTUP_BLOCK)
 		{
-			we_m = _HALL_get_we(&hall_values);
-			duty += OL_DUTY * CALL_TIME/OL_TIME;
-			if (duty >= OL_DUTY) system_state = SYSTEM_RUN_BLOCK;
+			we_m += OL_WE * CALL_TIME/OL_TIME;
+			const float32_t duty_boost = 0.15;
+			const float32_t duty_ramp = 0.0009;
+			duty = duty_boost + duty_ramp*we_m;
+			
+			if (we_m >= OL_DUTY) 
+			{
+				init_pi_block_speed(&c);
+				system_state = SYSTEM_RUN_BLOCK;
+			}
 		}
 		
 		else if (system_state == SYSTEM_RUN_BLOCK || system_state == SYSTEM_SHUTDOWN_BLOCK_CMD)
 	    {	
-	        we_m = _HALL_get_we(&hall_values);
+			//if (we_m < OL_WE * 0.8f && system_state == SYSTEM_RUN_BLOCK) system_state = SYSTEM_SHUTDOWN_BLOCK_CMD;
+			
 	        if (system_state == SYSTEM_SHUTDOWN_BLOCK_CMD) 
 	        {
 				we_ref = OL_WE;
-				if (we_m < OL_WE + 10.0) system_state = SYSTEM_SHUTDOWN_BLOCK;
+				if (fabsf(we_m) < (OL_WE + 10.0f)) system_state = SYSTEM_SHUTDOWN_BLOCK;
 			}
-	        duty = block_get_duty_from_speed(we_ref, we_m);
+	        duty =  _pi_controller_step(&c, we_ref, we_m);
 	    }
 		
 		else if (system_state == SYSTEM_SHUTDOWN_BLOCK)
 		{
-			we_m = _HALL_get_we(&hall_values);
-			duty -= OL_DUTY * CALL_TIME/OL_TIME;
-			if (duty <= 0.0)
+			we_m -= OL_WE * CALL_TIME/OL_TIME;
+			const float32_t duty_boost = 0.15;
+			const float32_t duty_ramp = 0.0009;
+			duty = duty_boost + duty_ramp*we_m;
+			if (we_m <= 0.0)
 		    {
 				duty = 0.0;
 				we_m = 0.0;
 		        system_state = SYSTEM_READY;
 		    }
 		}
-		bool dir_math_pos = (hall_values.direction >= 0);
-	    _Block(duty, hall_values.lut_idx, dir_math_pos);
+		
+		_Block(duty, hall_values.lut_idx, counterClockwise);
 		// Test:
 		PrintVars.we = we_m;
 		PrintVars.Duty = duty;
@@ -1307,6 +1311,7 @@ void controller_counter_intr_handler()
 		float32_t id = 0.0, iq = 0.0;
 		float32_t c = 0.0;
 		float32_t s = 0.0;
+		static float32_t iq_ref = 0.01;
 		
 		if (system_state == SYSTEM_STARTUP_FOC_OPENLOOP)
 		{
@@ -1341,6 +1346,8 @@ void controller_counter_intr_handler()
             	th = _SMO_GetTheta(&SMO);		
 			}
 			
+			//if (we < OL_WE * 0.8f && system_state == SYSTEM_RUN_FOC) system_state = SYSTEM_SHUTDOWN_FOC_CMD;
+			
 			c = cosf(th);
 			s = sinf(th);
 			_park_dq(ialpha, ibeta, s, c, &id, &iq);
@@ -1351,13 +1358,18 @@ void controller_counter_intr_handler()
 				if (system_state == SYSTEM_SHUTDOWN_FOC_CMD) 
 				{
 					we_ref = OL_WE;
-					if (we <= OL_WE + 10.0) system_state = SYSTEM_SHUTDOWN_FOC;
+					if (fabsf(we) <= (OL_WE + 10.0f)) system_state = SYSTEM_SHUTDOWN_FOC;
 				}
-		        if(rxData.control_mode == 0U)iq_ref = _pi_controller_step(&speed, we_ref, we);
+		        if (foc_controller_type == FOC_SPEED_CONTROLLED)
+				{
+				    iq_ref = _pi_controller_step(&speed, we_ref, we);
+				}
 		        count = 0;
 		    }
 		    else count++;
-		
+			
+			if (foc_controller_type == FOC_IQ_CONTROLLED) iq_ref = Iq_ref;
+			
 			vd = _pi_controller_step(&d, 0.0f, id);
 			vq = _pi_controller_step(&q, iq_ref, iq);
 		}
@@ -1384,8 +1396,10 @@ void controller_counter_intr_handler()
 		//Only for testing Print vars
 		PrintVars.we = we;
 		PrintVars.id = id;
-		PrintVars.iq = iq;
+		PrintVars.iq += alpha*(iq - PrintVars.iq);
+		PrintVars.vq = vq;
 		PrintVars.we_ref = we_ref;
+		PrintVars.iq_ref = iq_ref;
 		
 		float32_t valpha, vbeta;
 		_inv_park_ab(vd, vq, s, c, &valpha, &vbeta);
@@ -1402,8 +1416,8 @@ void controller_counter_intr_handler()
 
 void init_pi_d(PI_t *d, float32_t vd)
 {
-	d->ki 			= 219.9;
-	d->kp			= 0.54;
+	d->ki 			= 406.5;
+	d->kp			= 0.0015;
 	d->out_max		= VDD/2.0;
 	d->out_min		= -VDD/2.0;
 	d->Ts			= CONTROLLER_INTERRUPT_TIME;
@@ -1414,10 +1428,10 @@ void init_pi_d(PI_t *d, float32_t vd)
 
 void init_pi_q(PI_t *q, float32_t vq)
 {
-	q->ki 			= 219.9;
-	q->kp			= 0.54;
+	q->ki 			= 406.5;
+	q->kp			= 0.0015;
 	q->out_max		= VDD/2.0;
-	q->out_min		= -VDD/2.0;
+	q->out_min		= 0.001;
 	q->Ts			= CONTROLLER_INTERRUPT_TIME;
 	q->prevE		= 0.0;
 	q->prevU		= vq;
@@ -1426,10 +1440,10 @@ void init_pi_q(PI_t *q, float32_t vq)
 
 void init_pi_speed(PI_t *s)
 {
-	s->ki 			= 2.7;
-	s->kp			= 0.1;
-	s->out_max		= 20.0;
-	s->out_min		= 0.1;
+	s->ki 			= 0.9;
+	s->kp			= 0.3;
+	s->out_max		= 70.0;
+	s->out_min		= 0.001;
 	s->Ts			= CONTROLLER_INTERRUPT_TIME*10.0;
 	s->prevE		= 0.0;
 	s->prevU		= 0.0;
@@ -1483,9 +1497,10 @@ static inline void _prealign_start(void)
     preAlignment.stage = 0;
 	inj_theta_now = 0.0f;
 	preAlignment.theta_e_rad_final_ready = false;
-	NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
     preAlignment.inj_m = M_COARSE;
     _prepare_coarse(&preAlignment);
+    
+    Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
 }
 /******************************************************************************/
 
@@ -1600,11 +1615,7 @@ static inline void _prealign_step_pwm(void)
 				preAlignment.theta_e_rad_final_ready = true;
 				NVIC_DisableIRQ(pwm_reload_intr_config.intrSrc);
                 // Prealignment edning:
-				foc_type = FOC_SENSORLESS;
                 system_state = SYSTEM_STARTUP_FOC_OPENLOOP;
-                SMO_Init(&SMO);
-                NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
-                Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
             }
         } break;
     }
@@ -1634,30 +1645,28 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 		
 		if (count == 16U) adc_meas_valid = true;
 		else adc_meas_valid = false;
+
+		float32_t iu = -0.0189f * (float32_t)adc_data[0] + 38.352;
+		float32_t iv = -0.0184f * (float32_t)adc_data[1] + 37.684;
+		float32_t iw = -0.0172f * (float32_t)adc_data[2] + 35.205;
+		float32_t offset = (iu + iv + iw) / 3.0;
+		iu -= offset;iv -= offset; iw -= offset;
+		adc_meas.iu = iu; adc_meas.iv = iv; adc_meas.iw = iw;
+		adc_meas.idc = 0.028 * (float32_t)adc_data[3] - 57.082;
 		
-		/* adc calibration */
-		if (system_state == SYSTEM_CALIBRATION)
-		{
-			adc_calibration_feed_lowside_clamp(adc_data, adc_chan, count);
-			if (adc_calibration.done)
-            {
-				system_state = SYSTEM_READY;
-				_motor_outputs_stop_now();
-            }
-		}
-		else
-        {
-            adc_frame_t frame = _adc_unpack_frame(adc_data, adc_chan, count);
-            
-            meas_si_t tmp;
-            if (_adc_frame_to_si(&frame, &tmp))
-			{
-			    adc_meas = tmp;
-			    adc_meas_valid = true;
-			}
-			else adc_meas_valid = false;
-        }
-        
+		float32_t vu = 0.022 * (float32_t)adc_data[4] - 0.2378;
+		float32_t vv = 0.0219 * (float32_t)adc_data[5] - 0.1068;
+		float32_t vw = 0.0219 * (float32_t)adc_data[6] - 0.1021;
+		offset = (vu + vv + vw) / 3.0;
+		vu -= offset; vv -= offset; vw -= offset;
+		adc_meas.vu = vu; adc_meas.vv = vu; adc_meas.vu = vw;
+		adc_meas.vdc = 0.022 * (float32_t)adc_data[7] - 0.1133;
+		
+		// Tester:
+		PrintVars.ibus = adc_meas.idc;
+		PrintVars.vbus = adc_meas.vdc;
+		
+		
         if (system_state == SYSTEM_STARTUP_FOC_PREALIGN && inj_collect_now)
         {
 			float32_t ialpha, ibeta;
@@ -1679,256 +1688,6 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 }
 /******************************************************************************/
 
-/*******************************************************************************
-* Function Name: static inline adc_frame_t _adc_unpack_frame(const int16_t *data, const uint8_t *chan, uint8_t n)
-
-* puts adc values in a frame
-*******************************************************************************/
-inline adc_frame_t _adc_unpack_frame(const int16_t *data, const uint8_t *chan, uint8_t n)
-{
-    adc_frame_t f = {0};
-
-    for (uint8_t i = 0; i < n; i++)
-    {
-        switch (i)
-        {
-            case ADC_CH_IMS_U:     f.iu  = data[i]; f.valid_mask |= VM_IU;  break;
-            case ADC_CH_IMS_V:     f.iv  = data[i]; f.valid_mask |= VM_IV;  break;
-            case ADC_CH_IMS_W:     f.iw  = data[i]; f.valid_mask |= VM_IW;  break;
-            case ADC_CH_IMS_DCBUS: f.idc = data[i]; f.valid_mask |= VM_IDC; break;
-
-            case ADC_CH_VMS_U:     f.vu  = data[i]; f.valid_mask |= VM_VU;  break;
-            case ADC_CH_VMS_V:     f.vv  = data[i]; f.valid_mask |= VM_VV;  break;
-            case ADC_CH_VMS_W:     f.vw  = data[i]; f.valid_mask |= VM_VW;  break;
-            case ADC_CH_VMS_DCBUS: f.vdc = data[i]; f.valid_mask |= VM_VDC; break;
-			// for more values, add antoher case and make shure there is a engouh space to save the data(nothing else to do)
-            default: break;
-        }
-    }
-    return f;
-}
-/******************************************************************************/
-
-/*******************************************************************************
-* Function Name: static inline bool _adc_frame_to_si(const adc_frame_t *f, meas_si_t *out)
-
-* frame to Amps and Volts
-*******************************************************************************/
-inline bool _adc_frame_to_si(const adc_frame_t *f, volatile meas_si_t *out)
-{
-	static const float32_t K_IU  = -0.0171f;
-	static const float32_t K_IV  = -0.0199f;
-	static const float32_t K_IW  = -0.0166f;
-	static const float32_t K_IDC = -0.0157f;
-	
-	static const float32_t K_VPH = 0.0228f; 
-	static const float32_t B_VPH = -0.8265f;
-	
-	static const float32_t K_VDC = 0.0228f;  
-	static const float32_t B_VDC = -0.8265f;
-	
-    const uint8_t need = VM_IU|VM_IV|VM_IW|VM_IDC|VM_VU|VM_VV|VM_VW|VM_VDC;
-    if ((f->valid_mask & need) != need) return false;
-
-    out->iu  = _adc_to_amp_i16(f->iu,  adc_calibration.off_iu,  K_IU);
-    out->iv  = _adc_to_amp_i16(f->iv,  adc_calibration.off_iv,  K_IV);
-    out->iw  = _adc_to_amp_i16(f->iw,  adc_calibration.off_iw,  K_IW);
-    out->idc = _adc_to_amp_i16(f->idc, adc_calibration.off_idc, K_IDC);
-	
-	// Test: 
-	PrintVars.ibus = out->idc;
-	
-    out->vu = _adc_to_volt_i16(f->vu, adc_calibration.off_vu, K_VPH, B_VPH);
-    out->vv = _adc_to_volt_i16(f->vv, adc_calibration.off_vv, K_VPH, B_VPH);
-    out->vw = _adc_to_volt_i16(f->vw, adc_calibration.off_vw, K_VPH, B_VPH);
-
-    out->vdc = K_VDC * (float32_t)f->vdc + B_VDC;
-    
-    // Test: 
-	PrintVars.vbus = out->vdc;
-    return true;
-}
-/******************************************************************************/
-
-/*******************************************************************************
-* Function Name: void adc_calibration_start_lowside_clamp(uint32_t target_samples, uint32_t warmup_samples)
-
-* Sets up the adc calibration vars.
-*******************************************************************************/
-void adc_calibration_start_lowside_clamp(uint32_t target_samples, uint32_t warmup_samples)
-{
-    adc_calibration = (adc_cal_ls_clamp_t){0};
-    adc_calibration.target  = target_samples;
-    adc_calibration.warmup  = warmup_samples;
-    adc_calibration.running = true;
-    adc_calibration.done    = false;
-}
-/******************************************************************************/
-
-/*******************************************************************************
-* Function Name: static inline bool _cal_all_done(const adc_cal_ls_clamp_t *c)
-
-*
-*******************************************************************************/
-static inline bool _cal_all_done(adc_cal_ls_clamp_t *c)
-{
-    return (c->cnt_iu  >= c->target) &&
-           (c->cnt_iv  >= c->target) &&
-           (c->cnt_iw  >= c->target) &&
-           (c->cnt_idc >= c->target) &&
-           (c->cnt_vu  >= c->target) &&
-           (c->cnt_vv  >= c->target) &&
-           (c->cnt_vw  >= c->target) &&
-           (c->cnt_vdc >= c->target);
-}
-/******************************************************************************/
-
-/*******************************************************************************
-* Function Name: static inline float32_t _adc_to_amp_i16(int16_t adc_raw, int16_t adc_off, float32_t k)
-
-*
-*******************************************************************************/
-static inline float32_t _adc_to_amp_i16(int16_t adc_raw, int16_t adc_off, float32_t k)
-{
-    return k * ((float32_t)adc_raw - (float32_t)adc_off);
-}
-/******************************************************************************/
-
-/*******************************************************************************
-* Function Name: static inline float32_t _adc_to_volt_i16(int16_t adc_raw, int16_t adc_off, float32_t k, float32_t b)
-
-*
-*******************************************************************************/
-static inline float32_t _adc_to_volt_i16(int16_t adc_raw, int16_t adc_off, float32_t k, float32_t b)
-{
-    // generische lineare Kennlinie: V = k*(raw-off) + b
-    return k * ((float32_t)adc_raw - (float32_t)adc_off) + b;
-}
-/******************************************************************************/
-
-
-/*******************************************************************************
-* Function Name: static inline int16_t _adc_apply_offset(int16_t raw, int16_t off)
-
-*
-*******************************************************************************/
-static inline int16_t _adc_apply_offset(int16_t raw, int16_t off)
-{
-    return (int16_t)(raw - off);
-}
-/******************************************************************************/
-
-/*******************************************************************************
-* Function Name: void adc_calibration_feed_lowside_clamp(const int16_t *data, const uint8_t *chan, uint8_t n)
-
-*
-*******************************************************************************/
-void adc_calibration_feed_lowside_clamp(const int16_t *data, const uint8_t *chan, uint8_t n)
-{
-    if (!adc_calibration.running || adc_calibration.done) return;
-
-    for (uint8_t i = 0; i < n; i++)
-    {
-        const int16_t x = data[i];
-
-        switch (i)
-        {
-            case ADC_CH_IMS_U:
-                if (adc_calibration.wu_iu < adc_calibration.warmup) { adc_calibration.wu_iu++; break; }
-                if (adc_calibration.cnt_iu < adc_calibration.target) { adc_calibration.acc_iu += x; adc_calibration.cnt_iu++; }
-                break;
-
-            case ADC_CH_IMS_V:
-                if (adc_calibration.wu_iv < adc_calibration.warmup) { adc_calibration.wu_iv++; break; }
-                if (adc_calibration.cnt_iv < adc_calibration.target) { adc_calibration.acc_iv += x; adc_calibration.cnt_iv++; }
-                break;
-
-            case ADC_CH_IMS_W:
-                if (adc_calibration.wu_iw < adc_calibration.warmup) { adc_calibration.wu_iw++; break; }
-                if (adc_calibration.cnt_iw < adc_calibration.target) { adc_calibration.acc_iw += x; adc_calibration.cnt_iw++; }
-                break;
-
-            case ADC_CH_IMS_DCBUS:
-                if (adc_calibration.wu_idc < adc_calibration.warmup) { adc_calibration.wu_idc++; break; }
-                if (adc_calibration.cnt_idc < adc_calibration.target) { adc_calibration.acc_idc += x; adc_calibration.cnt_idc++; }
-                break;
-
-            case ADC_CH_VMS_U:
-                if (adc_calibration.wu_vu < adc_calibration.warmup) { adc_calibration.wu_vu++; break; }
-                if (adc_calibration.cnt_vu < adc_calibration.target) { adc_calibration.acc_vu += x; adc_calibration.cnt_vu++; }
-                break;
-
-            case ADC_CH_VMS_V:
-                if (adc_calibration.wu_vv < adc_calibration.warmup) { adc_calibration.wu_vv++; break; }
-                if (adc_calibration.cnt_vv < adc_calibration.target) { adc_calibration.acc_vv += x; adc_calibration.cnt_vv++; }
-                break;
-
-            case ADC_CH_VMS_W:
-                if (adc_calibration.wu_vw < adc_calibration.warmup) { adc_calibration.wu_vw++; break; }
-                if (adc_calibration.cnt_vw < adc_calibration.target) { adc_calibration.acc_vw += x; adc_calibration.cnt_vw++; }
-                break;
-
-            case ADC_CH_VMS_DCBUS:
-                if (adc_calibration.wu_vdc < adc_calibration.warmup) { adc_calibration.wu_vdc++; break; }
-                if (adc_calibration.cnt_vdc < adc_calibration.target) { adc_calibration.acc_vdc += x; adc_calibration.cnt_vdc++; }
-                break;
-			
-			// for more values, add antoher case and make shure there is a engouh space to save the data(nothing else to do)
-			
-            default:
-                break;
-        }
-    }
-
-    if (!_cal_all_done(&adc_calibration)) return;
-
-    // meanvalue (RAW) -> Offsets for 0A/0V
-    adc_calibration.off_iu  = (int16_t)(adc_calibration.acc_iu  / (int64_t)adc_calibration.cnt_iu);
-    adc_calibration.off_iv  = (int16_t)(adc_calibration.acc_iv  / (int64_t)adc_calibration.cnt_iv);
-    adc_calibration.off_iw  = (int16_t)(adc_calibration.acc_iw  / (int64_t)adc_calibration.cnt_iw);
-    adc_calibration.off_idc = (int16_t)(adc_calibration.acc_idc / (int64_t)adc_calibration.cnt_idc);
-
-    adc_calibration.off_vu  = (int16_t)(adc_calibration.acc_vu  / (int64_t)adc_calibration.cnt_vu);
-    adc_calibration.off_vv  = (int16_t)(adc_calibration.acc_vv  / (int64_t)adc_calibration.cnt_vv);
-    adc_calibration.off_vw  = (int16_t)(adc_calibration.acc_vw  / (int64_t)adc_calibration.cnt_vw);
-
-    // Is under voltage -> not 0V
-    adc_calibration.base_vdc_raw = (int16_t)(adc_calibration.acc_vdc / (int64_t)adc_calibration.cnt_vdc);
-
-    adc_calibration.done    = true;
-    adc_calibration.running = false;
-}
-/******************************************************************************/
-
-
-/*******************************************************************************
-* Function Name: void calibration_init(void)
-
-* Sets up the PWM counter for ADC calibaration.
-*******************************************************************************/
-void calibration_init()
-{
-	uint32_t SevSw_PeriodVal = Cy_TCPWM_PWM_GetPeriod0(SevSw_Counter_HW, SevSw_Counter_NUM);
-	Cy_TCPWM_PWM_SetCompare0Val(SevSw_Counter_HW, SevSw_Counter_NUM, SevSw_PeriodVal);
-	
-	uint32_t PWM_U_PeriodVal = Cy_TCPWM_PWM_GetPeriod0(PWM_Counter_U_HW, PWM_Counter_U_NUM);
-	uint32_t PWM_V_PeriodVal = Cy_TCPWM_PWM_GetPeriod0(PWM_Counter_V_HW, PWM_Counter_V_NUM);
-	uint32_t PWM_W_PeriodVal = Cy_TCPWM_PWM_GetPeriod0(PWM_Counter_W_HW, PWM_Counter_W_NUM);
-	
-	uint32_t PWM_PeriodVal = 4800; // If clock divider = 1
-	
-	if (PWM_U_PeriodVal != PWM_PeriodVal || PWM_V_PeriodVal != PWM_PeriodVal || PWM_W_PeriodVal != PWM_PeriodVal)
-	{	
-		Cy_TCPWM_PWM_SetPeriod0(PWM_Counter_U_HW, PWM_Counter_U_NUM, PWM_PeriodVal);
-		Cy_TCPWM_PWM_SetPeriod0(PWM_Counter_V_HW, PWM_Counter_V_NUM, PWM_PeriodVal);
-		Cy_TCPWM_PWM_SetPeriod0(PWM_Counter_W_HW, PWM_Counter_W_NUM, PWM_PeriodVal);
-	}
-	
-	NVIC_EnableIRQ(fifo_isr_cfg.intrSrc);
-	adc_calibration_start_lowside_clamp(2048u, 64u);
-	low_sides_all_on();
-}
-/******************************************************************************/
 
 /*******************************************************************************
 * Function Name: void sevSw_on()
@@ -1959,48 +1718,131 @@ void sevSw_off()
 *******************************************************************************/
 static void system_fsm_step()
 {
-    if (system_req == START_FOC)
-    {
-        system_state = SYSTEM_STARTUP_FOC_PREALIGN;
-        _pwm_all_enable();
-        NVIC_EnableIRQ(pwm_reload_intr_config.intrSrc);
-        _prealign_start();
-        system_req = NO_REQ;
-    }
-   	else if(system_req == START_BLOCK)
-    {	
-		system_state = SYSTEM_STARTUP_BLOCK;
-		block_start();
-		system_req = NO_REQ;
-	}
-	else if(system_req == STOP_FOC)
-    {	
-		system_state = SYSTEM_SHUTDOWN_FOC_CMD;
-		system_req = NO_REQ;
-	}
-	else if(system_req == STOP_BLOCK)
-    {	
-		system_state = SYSTEM_SHUTDOWN_BLOCK_CMD;
-		system_req = NO_REQ;
-	}
-	else if(system_req == ENABLE)
+	switch (system_state) 
 	{
-		sevSw_on();
-		system_req = NO_REQ;
-	}
-	else if(system_req == DISABLE)
-	{
-		sevSw_off();
-		system_req = NO_REQ;
-	}
+		case SYSTEM_OFF:
+		{
+			if (system_req == ENABLE) system_state = SYSTEM_ENABLE;
+		}break;
+		
+		case SYSTEM_INIT:
+		{
+			init();
+			system_state = SYSTEM_OFF;
+		}break;
+		
+		case SYSTEM_ENABLE:
+		{
+			enable();
+			sevSw_on();
+			high_sides_all_on();
+			system_state = SYSTEM_READY;
+			system_req = NO_REQ;
+			
+		}break;
+		
+		case SYSTEM_READY:
+		{
+			if (system_req == START_FOC) 
+			{
+				Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
+				Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
+				SMO_Init(&SMO);
+				_prealign_start();
+                NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
+				system_state = SYSTEM_STARTUP_FOC_PREALIGN;
+				system_req = NO_REQ;
+			}
+			else if (system_req == START_BLOCK)
+			{
+				Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
+				Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
+                NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
+				system_state = SYSTEM_STARTUP_BLOCK;
+				system_req = NO_REQ;
+			}
+			
+			else if (system_req == DISABLE) system_state = SYSTEM_DISABLE;
+		}break;
+		
+		case SYSTEM_STARTUP_FOC_PREALIGN:
+		{}break;
+		
+		case SYSTEM_STARTUP_FOC_OPENLOOP:
+		{}break;
+		
+		case SYSTEM_RUN_FOC:
+		{
+			if (system_req == STOP_FOC)
+			{
+				system_state = SYSTEM_SHUTDOWN_FOC_CMD;
+				system_req = NO_REQ;
+			}
+			else if(system_req == START_BLOCK)
+			{
+				system_state = SYSTEM_SHUTDOWN_FOC_CMD;
+			}
+			
+			else if(system_req == SWITCH_CTRL_METHODE)
+			{
+				foc_switch_ctrl_methode();
+			}
+			
+			else if(system_req == SWITCH_CONTROLLER_METHODE)
+			{
+				if (foc_controller_type == FOC_IQ_CONTROLLED) foc_controller_type = FOC_SPEED_CONTROLLED;
+				else if (foc_controller_type == FOC_SPEED_CONTROLLED) foc_controller_type = FOC_IQ_CONTROLLED;				
+			}
+		}break;
+		
+		case SYSTEM_SHUTDOWN_FOC_CMD:
+		{}break;
+		
+		case SYSTEM_SHUTDOWN_FOC:
+		{}break;	
+		
+		case SYSTEM_STARTUP_BLOCK:
+		{}break;
+		
+		case SYSTEM_RUN_BLOCK:
+		{
+			if (system_req == STOP_BLOCK)
+			{
+				system_state = SYSTEM_SHUTDOWN_BLOCK_CMD;
+				system_req = NO_REQ;
+			}
+			else if(system_req == START_FOC)
+			{
+				system_state = SYSTEM_SHUTDOWN_BLOCK_CMD;
+			}
+		}break;
+		
+		case SYSTEM_SHUTDOWN_BLOCK_CMD:
+		{}break;
+		
+		case SYSTEM_SHUTDOWN_BLOCK:
+		{}break;
+		
+		case SYSTEM_DISABLE:
+		{
+			sevSw_off();
+			system_state = SYSTEM_OFF;
+			system_req = NO_REQ;
+		}break;
+		
+		case SYSTEM_FAULT:
+		{
+			if (system_state == SYSTEM_RUN_FOC) system_state = SYSTEM_SHUTDOWN_FOC_CMD;
+			else if (system_state == SYSTEM_RUN_BLOCK) system_state = SYSTEM_SHUTDOWN_BLOCK_CMD;
+			else system_state = SYSTEM_DISABLE;
+		}break;
 
-	
+	}
 }
 /******************************************************************************/
 
 /*******************************************************************************
 * Function Name: static inline uint16_t le16(const uint8_t *p)
-				 static inline uint32_t le32(const uint8_t *p)
 				 bool DebugUart_TryReadPacket(void)
 				 static inline void wr16le(uint8_t *p, uint16_t v)
 				 static inline void wr32le(uint8_t *p, uint32_t v)
@@ -2123,10 +1965,83 @@ static inline void wr16le(uint8_t *p, uint16_t v)
     p[1] = (uint8_t)(v >> 8);
 }
 
+static inline uint16_t _u16_from_x10(float32_t x)
+{
+    if (x <= 0.0f) return 0u;
+    float32_t y = x * 10.0f + 0.5f;
+    if (y > 65535.0f) y = 65535.0f;
+    return (uint16_t)y;
+}
+
+static inline uint8_t _u8_from_x100(float32_t x)
+{
+    if (x <= 0.0f) return 0u;
+    float32_t y = x * 100.0f + 0.5f;
+    if (y > 255.0f) y = 255.0f;
+    return (uint8_t)y;
+}
+
+static void DebugUart_UpdateTxData(void)
+{
+    // Snapshot (kurz IRQ aus, damit keine “halb” geschriebenen floats)
+    float32_t we, ibus, vbus, id, iq, vd, vq;
+    system_state_t st;
+    bool err, warn;
+    float32_t pole_pairs;
+
+    we   = PrintVars.we;      // electrical rad/s (aus ISR gesetzt)
+    ibus = PrintVars.ibus;    // A
+    vbus = PrintVars.vbus;    // V
+    id   = PrintVars.id;      // A (FOC)
+    iq   = PrintVars.iq;      // A (FOC)
+    pole_pairs = (SMO.p > 0.0f) ? SMO.p : 1.0f;
+
+    // Speed aus we -> rpm (mechanisch): rpm = we/(2*pi*p) * 60
+    float32_t speed_rpm = (fabsf(we) / (TWO_PI * pole_pairs)) * 60.0f;
+
+    // torque = iq / 12 (nur sinnvoll in FOC)
+    float32_t torque_nm = 0.0f;
+
+    bool foc_valid = _is_foc_group(st);
+    if (foc_valid)
+    {
+        torque_nm = fabsf(iq) / 12.0f;
+    }
+    else
+    {
+        // Block: iq/torque nicht verfügbar -> 0
+        id = 0.0f; iq = 0.0f; vd = 0.0f; vq = 0.0f;
+    }
+
+    // txData füllen (deine Skalierungsvorgaben)
+    txData.speed = _u16_from_x10(speed_rpm);
+    txData.torgue = _u8_from_x100(torque_nm);
+
+    txData.i_bus = _u16_from_x10(fabsf(ibus));
+    txData.v_bus = _u16_from_x10(fabsf(vbus));
+
+    // Temperaturen sind im Code noch nicht vorhanden
+    txData.pcb_temp = 0u;
+    txData.winding_temp = 0u;
+
+    txData.id = _u16_from_x10(fabsf(id));
+    txData.iq = _u16_from_x10(fabsf(iq));
+    txData.vd = _u16_from_x10(fabsf(vd));
+    txData.vq = _u16_from_x10(fabsf(vq));
+
+    // signal bits
+    uint8_t sig = 0u;
+    if (err)  sig |= (1u << 0);   // LSB = error
+    if (warn) sig |= (1u << 1);   // bit1 = warning
+    txData.signal = sig;
+}
+
 void DebugUart_SendTxPacket(void)
 {
-	const uint8_t TX_PAYLOAD_LEN = 20U;
+    // txData aus aktuellen Laufwerten berechnen
+    DebugUart_UpdateTxData();
 
+    const uint8_t TX_PAYLOAD_LEN = 20U;
     uint8_t buf[1u + TX_PAYLOAD_LEN];
     uint8_t i = 0u;
 
@@ -2134,32 +2049,84 @@ void DebugUart_SendTxPacket(void)
 
     wr16le(&buf[i], txData.speed);        i += 2u;   // uint16_t
     buf[i++] = txData.torgue;                       // uint8_t
-    wr16le(&buf[i], txData.i_bus);        i += 2u;   // uint16_t
-    wr16le(&buf[i], txData.v_bus);        i += 2u;   // uint16_t
-    wr16le(&buf[i], txData.pcb_temp);     i += 2u;   // uint16_t
-    wr16le(&buf[i], txData.winding_temp); i += 2u;   // uint16_t
-    wr16le(&buf[i], txData.id);           i += 2u;   // uint16_t
-    wr16le(&buf[i], txData.iq);           i += 2u;   // uint16_t
-    wr16le(&buf[i], txData.vd);           i += 2u;   // uint16_t
-    wr16le(&buf[i], txData.vq);           i += 2u;   // uint16_t
 
-    buf[i++] = txData.signal;                       // uint8_t
+    wr16le(&buf[i], txData.i_bus);        i += 2u;
+    wr16le(&buf[i], txData.v_bus);        i += 2u;
+    wr16le(&buf[i], txData.pcb_temp);     i += 2u;
+    wr16le(&buf[i], txData.winding_temp); i += 2u;
+    wr16le(&buf[i], txData.id);           i += 2u;
+    wr16le(&buf[i], txData.iq);           i += 2u;
+    wr16le(&buf[i], txData.vd);           i += 2u;
+    wr16le(&buf[i], txData.vq);           i += 2u;
+
+    buf[i++] = txData.signal;
 
     Cy_SCB_UART_PutArray(DEBUG_UART_HW, buf, i);
 }
-/******************************************************************************/
+
 
 void Poti_read(void)
 {
 
     int32_t raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(12U);
-    //we_ref = (float32_t)raw_value_idPot / 4095.0f * 1400.0 + 200.0;
-
+    We_ref = (float32_t)raw_value_idPot / 4095.0f * 428.0 + 200.0;
     
     raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(10U);
-	// = (float32_t)raw_value_idPot / 4095.0f * 1000.0;
+	alpha = (float32_t)raw_value_idPot / 4095.0f;
 
 }
+
+/*******************************************************************************
+* Function Name: void enable()
+
+* enables all parts.
+* Has to be called at the beginning.
+*******************************************************************************/
+void enable()
+{
+	Cy_TCPWM_Counter_Enable(Test_Counter_HW, Test_Counter_NUM);
+	Cy_TCPWM_Counter_Enable(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
+    NVIC_EnableIRQ(Speed_Measurment_intr_config.intrSrc);
+    Cy_TCPWM_Counter_Enable(Safety_Counter_HW, Safety_Counter_NUM);
+    NVIC_EnableIRQ(Safety_intr_config.intrSrc);
+    Cy_TCPWM_Counter_Enable(Controller_Counter_HW, Controller_Counter_NUM);
+    Cy_TCPWM_PWM_Enable(PWM_Counter_U_HW, PWM_Counter_U_NUM);
+    Cy_TCPWM_PWM_Enable(PWM_Counter_V_HW, PWM_Counter_V_NUM);
+    Cy_TCPWM_PWM_Enable(PWM_Counter_W_HW, PWM_Counter_W_NUM);
+    Cy_TCPWM_PWM_Enable(SevSw_Counter_HW, SevSw_Counter_NUM);
+    Cy_TCPWM_Counter_Enable(Message_Counter_HW, Message_Counter_NUM);
+    NVIC_EnableIRQ(hall_isr12_config.intrSrc);
+    NVIC_EnableIRQ(hall_isr3_config.intrSrc);
+    NVIC_EnableIRQ(fifo_isr_cfg.intrSrc);
+}
+
+/******************************************************************************/
+
+/*******************************************************************************
+* Function Name: void enable()
+
+* enables all parts.
+* Has to be called at the beginning.
+*******************************************************************************/
+void disable()
+{
+	Cy_TCPWM_Counter_Disable(Test_Counter_HW, Test_Counter_NUM);
+	Cy_TCPWM_Counter_Disable(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
+    NVIC_DisableIRQ(Speed_Measurment_intr_config.intrSrc);
+    Cy_TCPWM_Counter_Disable(Safety_Counter_HW, Safety_Counter_NUM);
+    NVIC_DisableIRQ(Safety_intr_config.intrSrc);
+    Cy_TCPWM_Counter_Disable(Controller_Counter_HW, Controller_Counter_NUM);
+    Cy_TCPWM_PWM_Disable(PWM_Counter_U_HW, PWM_Counter_U_NUM);
+    Cy_TCPWM_PWM_Disable(PWM_Counter_V_HW, PWM_Counter_V_NUM);
+    Cy_TCPWM_PWM_Disable(PWM_Counter_W_HW, PWM_Counter_W_NUM);
+    Cy_TCPWM_PWM_Disable(SevSw_Counter_HW, SevSw_Counter_NUM);
+    Cy_TCPWM_Counter_Disable(Message_Counter_HW, Message_Counter_NUM);
+    NVIC_DisableIRQ(hall_isr12_config.intrSrc);
+    NVIC_DisableIRQ(hall_isr3_config.intrSrc);
+    NVIC_DisableIRQ(fifo_isr_cfg.intrSrc);
+}
+
+/******************************************************************************/
 
 /*******************************************************************************
 * Function Name: void init(void)
@@ -2169,7 +2136,6 @@ void Poti_read(void)
 *******************************************************************************/
 void init()
 {
-	system_state = SYSTEM_INIT;
     cy_rslt_t result;
 	
     /* UART init ofr DEBUG_UART */
@@ -2188,43 +2154,30 @@ void init()
 
     /* Test Counter init, used to trigger PWM */
 	if (result != Cy_TCPWM_Counter_Init(Test_Counter_HW, Test_Counter_NUM, &Test_Counter_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_Counter_Enable(Test_Counter_HW, Test_Counter_NUM);
 
     /* Speed Counter init, used calculate speed in Blockkommuation, sensored FOC */
 	if(result != Cy_TCPWM_Counter_Init(Speed_Measurment_Counter_HW,Speed_Measurment_Counter_NUM, &Speed_Measurment_Counter_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_Counter_Enable(Speed_Measurment_Counter_HW, Speed_Measurment_Counter_NUM);
     Cy_SysInt_Init(&Speed_Measurment_intr_config, speed_measurment_intr_handler);
-    NVIC_EnableIRQ(Speed_Measurment_intr_config.intrSrc);
     
     /* Safety Counter turns off the machine if something goes wrong */
    	if(result != Cy_TCPWM_Counter_Init(Safety_Counter_HW,Safety_Counter_NUM, &Safety_Counter_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_Counter_Enable(Safety_Counter_HW, Safety_Counter_NUM);
-    Cy_SysInt_Init(&Safety_intr_config, safety_intr_handler);
-    //NVIC_EnableIRQ(Safety_intr_config.intrSrc);
+	Cy_SysInt_Init(&Safety_intr_config, safety_intr_handler);
 
     /* Controller Counter init, used for PI Controller */
 	if(result != Cy_TCPWM_Counter_Init(Controller_Counter_HW,Controller_Counter_NUM, &Controller_Counter_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_Counter_Enable(Controller_Counter_HW, Controller_Counter_NUM);
     Cy_SysInt_Init(&Controller_counter_intr_config, controller_counter_intr_handler);
 
     /* PWM U/V/W init */
 	if (result != Cy_TCPWM_PWM_Init(PWM_Counter_U_HW, PWM_Counter_U_NUM, &PWM_Counter_U_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_PWM_Enable(PWM_Counter_U_HW, PWM_Counter_U_NUM);
     // PWM Terminalcount Interrupt for rotor pre alligment
     Cy_SysInt_Init(&pwm_reload_intr_config, pwm_reload_intr_handler);
-
 	if (result != Cy_TCPWM_PWM_Init(PWM_Counter_V_HW, PWM_Counter_V_NUM, &PWM_Counter_V_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_PWM_Enable(PWM_Counter_V_HW, PWM_Counter_V_NUM);
-
 	if (result != Cy_TCPWM_PWM_Init(PWM_Counter_W_HW, PWM_Counter_W_NUM, &PWM_Counter_W_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_PWM_Enable(PWM_Counter_W_HW, PWM_Counter_W_NUM);
     
 	if (result != Cy_TCPWM_PWM_Init(SevSw_Counter_HW, SevSw_Counter_NUM, &SevSw_Counter_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_PWM_Enable(SevSw_Counter_HW, SevSw_Counter_NUM);
     
     /*for sending Messages to Motorpanel*/
     if(result != Cy_TCPWM_Counter_Init(Message_Counter_HW,Message_Counter_NUM, &Message_Counter_config)) { CY_ASSERT(0); }
-    Cy_TCPWM_Counter_Enable(Message_Counter_HW, Message_Counter_NUM);
     Cy_SysInt_Init(&Uart_intr_config, DebugUart_SendTxPacket);
     //NVIC_EnableIRQ(Uart_intr_config.intrSrc);
 
@@ -2234,8 +2187,6 @@ void init()
     Cy_GPIO_Pin_Init(HALL3_PORT, HALL3_PIN, &HALL3_config);
     Cy_SysInt_Init(&hall_isr12_config, hall_interrupt_handler);
     Cy_SysInt_Init(&hall_isr3_config, hall_interrupt_handler);
-    NVIC_EnableIRQ(hall_isr12_config.intrSrc);
-    NVIC_EnableIRQ(hall_isr3_config.intrSrc);
     
     /* Fan PWM Pin*/
     Cy_GPIO_Pin_Init(FAN_PWM_PORT, FAN_PWM_PIN, &FAN_PWM_config);
@@ -2249,11 +2200,8 @@ void init()
     /* ADC FIFO ISR */
     Cy_HPPASS_FIFO_SetInterruptMask(CY_HPPASS_INTR_FIFO_0_LEVEL);
     Cy_SysInt_Init(&fifo_isr_cfg, pass_0_sar_0_fifo_0_buffer_0_callback);
-    system_state = SYSTEM_CALIBRATION;
-    calibration_init();
 }
 /*******************************************************************************/
-
 
 int main(void)
 {
@@ -2269,83 +2217,77 @@ int main(void)
 
     /* Enable global interrupts */
     __enable_irq();
-    init();
-    //static uint8_t sw1_prev = 0, sw2_prev = 0;
+	// Test:
+	foc_controller_type = FOC_SPEED_CONTROLLED;
+	foc_type = FOC_SENSORED;
+	Iq_ref = 0.0;
+
+	uint8_t sw1_prev = 1u;
+    uint8_t sw2_prev = 1u;
+    static uint8_t count = 0U;
 	
     for (;;)
     {
-		/*
-		
-		READY:
-		SW1 FOC
-		SW2 BLOCK
-		
-		RUN_FOC:
-		SW1 toggelt sensorless <-> hall
-		SW2: Stop
-		
-		RUN_BLOCK:
-		SW1: --		
-		SW2: Stop
-		
-		uint8_t sw1 = (uint8_t)Cy_GPIO_Read(SW1_PORT, SW1_NUM);
-	    uint8_t sw2 = (uint8_t)Cy_GPIO_Read(SW2_PORT, SW2_NUM);
-	
-	    bool sw1_rise = (sw1 == 1u && sw1_prev == 0u);
-	    bool sw2_rise = (sw2 == 1u && sw2_prev == 0u);
-		
-		// --- READY: select mode + start ---
-	    if (system_state == SYSTEM_READY)
-	    {	
-	        if (sw1_rise)
-	        {
-	            system_req = START_FOC;
-	        }
-	        if (sw2_rise)
-	        {
-	            system_req = START_BLOCK;
-	        }
-	    }
-	
-	    // --- RUN_FOC ---
-	    if (system_state == SYSTEM_RUN_FOC)
-	    {
-	        if (sw1_rise)
-	        {
-				foc_switch_ctrl_methode();
+        uint8_t sw1 = (uint8_t)Cy_GPIO_Read(SW1_PORT, SW1_NUM);
+        uint8_t sw2 = (uint8_t)Cy_GPIO_Read(SW2_PORT, SW2_NUM);
 
-	        }
-	
-	        if (sw2_rise)
-	        {
-				system_req = STOP_FOC;
-	        }
+        bool sw1_press = (sw1_prev == 1u) && (sw1 == 0u);
+        bool sw2_press = (sw2_prev == 1u) && (sw2 == 0u);
 
-	    }
-	
-	    // --- RUN_BLOCK ---
-	    if (system_state == SYSTEM_RUN_BLOCK)
-	    {
-	        if (sw1_rise)
-	        {
+        sw1_prev = sw1;
+        sw2_prev = sw2;
+        
+        if (sw1_press)
+        {
+			count++;
+			if(count > 3U) count = 0U;
+		}
+		
+		if (system_req == NO_REQ)
+		{
+			switch (system_state) 
+			{
+				case SYSTEM_OFF:
+				{
+					if (count == 0U && sw2_press) system_req = ENABLE;
+				}break;
 				
-	        }
-	        else if (sw2_rise)
-	        {
-				system_req = STOP_BLOCK;
-	        }
-	    }
-	
-	    sw1_prev = sw1;
-	    sw2_prev = sw2;
-		*/
-	    // FSM progresses here
-	    system_fsm_step();
-	    
-	    DebugUart_TryReadPacket();
-	    DebugUart_SendTxPacket();
-	    
+				case SYSTEM_READY:
+				{
+					if (count == 0U && sw2_press) system_req = START_FOC;
+					else if (count == 1U && sw2_press) system_req = START_BLOCK;
+					else if (count == 2U && sw2_press) system_req = DISABLE;
+				}break;
+				
+				case SYSTEM_RUN_FOC:
+				{
+					if (count == 0U && sw2_press) system_req = STOP_FOC;
+					else if (count == 1U && sw2_press) system_req = SWITCH_CONTROLLER_METHODE;
+					else if (count == 2U && sw2_press) system_req = SWITCH_CTRL_METHODE;
+					else if (count == 3U && sw2_press) system_req = START_BLOCK;
+				}break;
+				
+				case SYSTEM_RUN_BLOCK:
+				{
+					if (count == 0U && sw2_press) system_req = STOP_BLOCK;
+					else if (count == 1U && sw2_press) system_req = START_BLOCK;
+				}break;
+			}
+		}
+
 		
+		
+		
+	    system_fsm_step();
+	    //DebugUart_SendTxPacket();
+	    char print_Array[41];
+    	float32_t data_Array[10] = {PrintVars.we_ref, PrintVars.we, PrintVars.iq_ref, PrintVars.iq, PrintVars.vq, PrintVars.vbus, PrintVars.ibus, (float32_t)count, PrintVars.we_hall, PrintVars.we_OBS};
+    	print_Array[0] = 0xAA;
+    	memcpy(&print_Array[1], data_Array, sizeof(data_Array));
+    	for (int i = 0; i < (int)sizeof(print_Array); i++) 
+    	{ 
+			printf("%c", print_Array[i]); 
+		}
     }
 }
 
