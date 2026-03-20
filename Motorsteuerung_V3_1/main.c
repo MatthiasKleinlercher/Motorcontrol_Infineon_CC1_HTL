@@ -110,7 +110,6 @@ typedef struct
 {
     int16_t iu, iv, iw, idc;
     int16_t vu, vv, vw, vdc;
-    uint8_t valid_mask; // check if channels were there
 } adc_frame_t;
 
 // Amps and Volts values
@@ -148,6 +147,18 @@ typedef struct
 
 } prealign_t;
 
+// PI controller struct
+typedef struct 
+{
+    float32_t kp;       // proportional gain
+    float32_t ki;       // integral gain (per second)
+    float32_t Ts;       // sample time [s]
+    float32_t out_min;  // actuator min
+    float32_t out_max;  // actuator max
+    float32_t prevU;
+    float32_t prevE;
+    bool useIntFlag;
+} PI_t;
 
 // Slide Mode Observer Variablen
 typedef struct
@@ -158,6 +169,11 @@ typedef struct
 	float32_t Ts; // Abtastzeit
 	float32_t fs; // Abtastfrequenz
 	float32_t p; //Poolparzahl
+	PI_t c;
+	float32_t prevTh;
+	float32_t dtheta_sum;
+	uint32_t dtheta_count;
+	float32_t speed_avg_samples;
 	
 	// ---- LPF auf Back-EMF ----
 	float32_t w_e0_emf; // LPF-Bandbreite
@@ -186,19 +202,6 @@ typedef struct
 	float32_t theta_shift;
 } smo_t;
 smo_t SMO;
-
-// PI controller struct
-typedef struct 
-{
-    float32_t kp;       // proportional gain
-    float32_t ki;       // integral gain (per second)
-    float32_t Ts;       // sample time [s]
-    float32_t out_min;  // actuator min
-    float32_t out_max;  // actuator max
-    float32_t prevU;
-    float32_t prevE;
-    bool useIntFlag;
-} PI_t;
 
 // Hall measurmente
 typedef struct
@@ -345,6 +348,8 @@ typedef struct
 	float32_t vq;
 	float32_t iq_ref;
 	float32_t Duty;
+	uint32_t PCB_TEMP;
+	uint32_t BLDC_TEMP;
 }Print_t;
 /*******************************************************************************
 * Macros
@@ -371,6 +376,7 @@ volatile foc_controller_type_t foc_controller_type = FOC_SPEED_CONTROLLED;
 volatile bool counterClockwise = 0U; //CCW = true; CW = false;
 volatile float32_t We_ref = 0.0f;
 volatile float32_t Iq_ref = 0.0f;
+volatile float32_t Duty = 0.0f;
 
 typedef enum {	ENABLE_SYSTEM,
 				DISABLE_SYSTEM,
@@ -423,6 +429,39 @@ static hall_meas_t hall_values = {};
 volatile rx_t rxData;
 volatile tx_t txData;
 static rx_t rxPrev = {0};
+
+// Block
+const uint8_t hall_to_lut[8] =
+{
+    255, // 000
+    5,   // 001
+    3,   // 010
+    4,   // 011
+    1,   // 100
+    0,   // 101
+    2,   // 110
+    255  // 111
+};
+
+const float32_t lut_to_theta[6] = 
+{
+	0.26179939,
+	1.57079633,
+	2.87979327,
+	-2.87979327,
+	-1.57079633,
+	-0.26179939
+};
+
+const float32_t lut_to_theta_sector[6] = 
+{
+	0.0,
+	1.04719755,
+	2.0943951,
+	3.14159265,
+	-2.0943951,
+	-1.04719755
+};
 
 // Test Vars
 volatile Print_t PrintVars;
@@ -704,7 +743,7 @@ static inline void _svpwm(float32_t Va, float32_t Vb, float32_t Vc, float32_t ov
 static inline void _Block(float32_t Duty, uint8_t lut_idx, bool CounterClockwise)
 {	
 	/*TODO: Check if Arrays are correct for clock and countclockwise*/
-	static int16_t lut[LUT_SIZE][3] =
+	static int16_t cclut[LUT_SIZE][3] =
 	{
 		{ HIGH, LOW,  OFF },   // Zustand 1: U+ V- W offen
 	    { HIGH, OFF, LOW },    // Zustand 2: U+ W- V offen
@@ -714,7 +753,7 @@ static inline void _Block(float32_t Duty, uint8_t lut_idx, bool CounterClockwise
 	    { OFF, LOW, HIGH }     // Zustand 6: W+ V- U offen
 	};
 
-	static int16_t cclut[LUT_SIZE][3] = 
+	static int16_t lut[LUT_SIZE][3] = 
 	{
 		{HIGH, OFF, LOW},
 		{OFF, HIGH, LOW},
@@ -982,7 +1021,20 @@ void SMO_Init(smo_t *smo)
     smo->omega_hat_f = 0.0f;
     
     smo->theta_shift = 0.36f;
+    
+    // Test ohne LPF für e
+    smo->c.ki = 130.0f;
+    smo->c.kp = 9.0f;
+    smo->c.out_max = 1675.0f;
+    smo->c.out_min = -1675.0f;
+    smo->c.prevE = 0.0;
+    smo->c.prevU = 0.0;
+    smo->c.Ts = CONTROLLER_INTERRUPT_TIME;
+    smo->prevTh = 0.0f;
+    smo->speed_avg_samples = 32;
 }
+
+// Test ohne LPF für e
 
 static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, float32_t vAlpha, float32_t vBeta)
 {
@@ -1020,7 +1072,44 @@ static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, fl
     smo->i_beta_prev  = iBeta;
 }
 
+/*
+static inline void _SMO_Update(smo_t *smo, float32_t iAlpha, float32_t iBeta, float32_t vAlpha, float32_t vBeta)
+{
+	const float32_t di_alpha = (iAlpha - smo->i_alpha_prev) * smo->fs;
+    const float32_t di_beta  = (iBeta  - smo->i_beta_prev)  * smo->fs;
+    smo->i_alpha_prev = iAlpha;
+    smo->i_beta_prev  = iBeta;
+	
+    float32_t e_alpha = vAlpha - (smo->R * iAlpha) - (smo->L * di_alpha);
+    float32_t e_beta  = vBeta  - (smo->R * iBeta)  - (smo->L * di_beta);
+	
+	smo->ealpha_f += alpha * (e_alpha - smo->ealpha_f);
+	smo->ebeta_f += alpha * (e_beta - smo->ebeta_f);
+	
+	smo->theta_rad = atan2f(-smo->ealpha_f, smo->ebeta_f);
+	
+	float32_t dtheta = _wrap_pi(smo->theta_rad - smo->prevTh);
+	
+	smo->dtheta_sum += dtheta;
+	smo->dtheta_count++;
+	
+	
+    if (smo->dtheta_count >= smo->speed_avg_samples)
+    {
+        smo->omega_hat_f = smo->dtheta_sum / ((float32_t)smo->speed_avg_samples * smo->Ts);
 
+        smo->dtheta_sum = 0.0f;
+        smo->dtheta_count = 0;
+    }
+
+     Update states 
+    smo->theta_prev   = smo->theta_rad;
+    smo->i_alpha_prev = iAlpha;
+    smo->i_beta_prev  = iBeta;
+	
+	PrintVars.we_OBS = smo->omega_hat_f;
+}
+*/
 static inline float32_t _SMO_GetTheta(const smo_t* smo){ return smo->theta_rad; }
 static inline float32_t _SMO_GetOmega(const smo_t* smo){ return smo->omega_hat_f; }
 static inline float32_t _SMO_GetSpeed(const smo_t* smo){ return (smo->omega_hat / (TWO_PI * smo->p)) * 60.0f;}
@@ -1033,38 +1122,6 @@ static inline float32_t _SMO_GetSpeed(const smo_t* smo){ return (smo->omega_hat 
 				 
 * 
 *******************************************************************************/
-
-const uint8_t hall_to_lut[8] =
-{
-    255, // 000
-    5,   // 001
-    3,   // 010
-    4,   // 011
-    1,   // 100
-    0,   // 101
-    2,   // 110
-    255  // 111
-};
-
-const float32_t lut_to_theta[6] = 
-{
-	0.26179939,
-	1.57079633,
-	2.87979327,
-	-2.87979327,
-	-1.57079633,
-	-0.26179939
-};
-
-const float32_t lut_to_theta_sector[6] = 
-{
-	0.0,
-	1.04719755,
-	2.0943951,
-	3.14159265,
-	-2.0943951,
-	-1.04719755
-};
 
 uint8_t read_hall_state(void)
 {
@@ -1174,6 +1231,18 @@ static inline float32_t _HALL_get_we(hall_meas_t* hall) {return hall->we_hall;}
 
 * PI COntroller function
 *******************************************************************************/
+void OL_BLOCK(uint8_t lut_idx)
+{
+
+}
+/******************************************************************************/
+
+
+/*******************************************************************************
+* Function Name: float32_t inline _pi_controller_step(PI_t *c, float32_t setpoint, float32_t measurement)
+
+* PI COntroller function
+*******************************************************************************/
 static inline float32_t _pi_controller_step(PI_t *c, float32_t setpoint, float32_t measurement)
 {
 	float32_t e = setpoint - measurement;
@@ -1223,10 +1292,10 @@ void controller_counter_intr_handler()
 {
 	uint32_t intrStatus = Cy_TCPWM_GetInterruptStatusMasked(Controller_Counter_HW, Controller_Counter_NUM);
 	
-	const float32_t OL_TIME = 5.0;
-	const float32_t OL_WE = 200.0;
-	const float32_t OL_DUTY = 0.2;
-	const float32_t CALL_TIME = CONTROLLER_INTERRUPT_TIME;
+	static const float32_t OL_TIME = 5.0;
+	static const float32_t OL_WE = 200.0;
+	static const float32_t OL_DUTY = 0.2;
+	static const float32_t CALL_TIME = CONTROLLER_INTERRUPT_TIME;
 	
 	float32_t we_ref = _sat(We_ref, 200.0f, 628.0f);
 	
@@ -1237,53 +1306,62 @@ void controller_counter_intr_handler()
 	if (system_state == SYSTEM_STARTUP_BLOCK || system_state == SYSTEM_RUN_BLOCK || system_state == SYSTEM_SHUTDOWN_BLOCK_CMD || system_state == SYSTEM_SHUTDOWN_BLOCK)
 	{
 		static PI_t c;
-		static float32_t duty = 0.0;
-		static float32_t we_m = 0.0;
-		if(system_state != SYSTEM_STARTUP_BLOCK && system_state == SYSTEM_SHUTDOWN_BLOCK) we_m = _HALL_get_we(&hall_values);
+		static float32_t duty = 0.0f;
+		static float32_t we_m = 0.0f;
+ 		we_m = _HALL_get_we(&hall_values);
 		if (system_state == SYSTEM_STARTUP_BLOCK)
 		{
-			we_m += OL_WE * CALL_TIME/OL_TIME;
-			const float32_t duty_boost = 0.15;
-			const float32_t duty_ramp = 0.0009;
-			duty = duty_boost + duty_ramp*we_m;
-			
-			if (we_m >= OL_DUTY) 
+			static uint16_t count = 0U;
+			static uint16_t count_for_lut = 0U;
+			static uint8_t lut_idx_count = 0U;
+			if (count < 8400U) 
 			{
+				count++;
+				count_for_lut++;
+				duty = 0.15* (float32_t)count/(float32_t)8400U;
+				
+				if (count_for_lut > 1400U)
+				{
+					count_for_lut = 0U;
+					if (counterClockwise == 0U) lut_idx_count--;
+					if (counterClockwise == 1U) lut_idx_count++;
+					if (lut_idx_count > 5U) lut_idx_count = 0U;
+					if (lut_idx_count < 0U) lut_idx_count = 5U;
+				}
+				_Block(duty, lut_idx_count, counterClockwise);
+			}
+			else
+ 			{
+				count = 0U;
+				lut_idx_count = 0U;
 				init_pi_block_speed(&c);
+				c.prevU = duty;
 				system_state = SYSTEM_RUN_BLOCK;
 			}
 		}
 		
 		else if (system_state == SYSTEM_RUN_BLOCK || system_state == SYSTEM_SHUTDOWN_BLOCK_CMD)
 	    {	
-			//if (we_m < OL_WE * 0.8f && system_state == SYSTEM_RUN_BLOCK) system_state = SYSTEM_SHUTDOWN_BLOCK_CMD;
-			
-	        if (system_state == SYSTEM_SHUTDOWN_BLOCK_CMD) 
-	        {
-				we_ref = OL_WE;
-				if (fabsf(we_m) < (OL_WE + 10.0f)) system_state = SYSTEM_SHUTDOWN_BLOCK;
+			if (system_state == SYSTEM_SHUTDOWN_BLOCK_CMD) 
+			{
+				we_ref = 10.0;
+				if (fabsf(we_m) <= (20.0f)) system_state = SYSTEM_SHUTDOWN_BLOCK;
 			}
 	        duty =  _pi_controller_step(&c, we_ref, we_m);
+	        _Block(duty, hall_values.lut_idx, counterClockwise);
 	    }
 		
 		else if (system_state == SYSTEM_SHUTDOWN_BLOCK)
 		{
-			we_m -= OL_WE * CALL_TIME/OL_TIME;
-			const float32_t duty_boost = 0.15;
-			const float32_t duty_ramp = 0.0009;
-			duty = duty_boost + duty_ramp*we_m;
-			if (we_m <= 0.0)
-		    {
-				duty = 0.0;
-				we_m = 0.0;
-		        system_state = SYSTEM_READY;
-		    }
+			_Block(0.0, hall_values.lut_idx, counterClockwise);
+			duty = 0.0;
+			we_m = 0.0;
+	        system_state = SYSTEM_READY;
 		}
-		
-		_Block(duty, hall_values.lut_idx, counterClockwise);
 		// Test:
 		PrintVars.we = we_m;
 		PrintVars.Duty = duty;
+		PrintVars.we_ref = we_ref;
 	}
 	
 	// =========================
@@ -1346,8 +1424,6 @@ void controller_counter_intr_handler()
             	th = _SMO_GetTheta(&SMO);		
 			}
 			
-			//if (we < OL_WE * 0.8f && system_state == SYSTEM_RUN_FOC) system_state = SYSTEM_SHUTDOWN_FOC_CMD;
-			
 			c = cosf(th);
 			s = sinf(th);
 			_park_dq(ialpha, ibeta, s, c, &id, &iq);
@@ -1396,7 +1472,7 @@ void controller_counter_intr_handler()
 		//Only for testing Print vars
 		PrintVars.we = we;
 		PrintVars.id = id;
-		PrintVars.iq += alpha*(iq - PrintVars.iq);
+		PrintVars.iq = iq;
 		PrintVars.vq = vq;
 		PrintVars.we_ref = we_ref;
 		PrintVars.iq_ref = iq_ref;
@@ -1440,8 +1516,8 @@ void init_pi_q(PI_t *q, float32_t vq)
 
 void init_pi_speed(PI_t *s)
 {
-	s->ki 			= 0.9;
-	s->kp			= 0.3;
+	s->ki 			= 1.4;
+	s->kp			= 0.1;
 	s->out_max		= 70.0;
 	s->out_min		= 0.001;
 	s->Ts			= CONTROLLER_INTERRUPT_TIME*10.0;
@@ -1452,8 +1528,8 @@ void init_pi_speed(PI_t *s)
 
 static void init_pi_block_speed(PI_t *s)
 {
-    s->ki = 3.0;
-    s->kp = 0.0004;
+    s->ki = 0.2;
+    s->kp = 0.0015;
     s->out_max = 0.99;
     s->out_min = 0.0f;
     s->Ts = CONTROLLER_INTERRUPT_TIME;
@@ -1652,7 +1728,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 		float32_t offset = (iu + iv + iw) / 3.0;
 		iu -= offset;iv -= offset; iw -= offset;
 		adc_meas.iu = iu; adc_meas.iv = iv; adc_meas.iw = iw;
-		adc_meas.idc = 0.028 * (float32_t)adc_data[3] - 57.082;
+		adc_meas.idc = -0.028 * (float32_t)adc_data[3] + 57.082;
 		
 		float32_t vu = 0.022 * (float32_t)adc_data[4] - 0.2378;
 		float32_t vv = 0.0219 * (float32_t)adc_data[5] - 0.1068;
@@ -1745,6 +1821,9 @@ static void system_fsm_step()
 		{
 			if (system_req == START_FOC) 
 			{
+			    NVIC_EnableIRQ(hall_isr12_config.intrSrc);
+    			NVIC_EnableIRQ(hall_isr3_config.intrSrc);
+    			_pwm_all_enable();
 				Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
 				Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
 				SMO_Init(&SMO);
@@ -1757,6 +1836,8 @@ static void system_fsm_step()
 			{
 				Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
 				Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
+				NVIC_EnableIRQ(hall_isr12_config.intrSrc);
+    			NVIC_EnableIRQ(hall_isr3_config.intrSrc);
                 NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
 				system_state = SYSTEM_STARTUP_BLOCK;
 				system_req = NO_REQ;
@@ -2068,12 +2149,17 @@ void DebugUart_SendTxPacket(void)
 void Poti_read(void)
 {
 
-    int32_t raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(12U);
-    We_ref = (float32_t)raw_value_idPot / 4095.0f * 428.0 + 200.0;
+    int32_t raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(12U);
+    We_ref = (float32_t)raw_value_Pot / 4095.0f * 550.0 + 200.0;
     
-    raw_value_idPot = Cy_HPPASS_SAR_Result_ChannelRead(10U);
-	alpha = (float32_t)raw_value_idPot / 4095.0f;
-
+    raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(10U);
+	alpha = (float32_t)raw_value_Pot / 4095.0f * 0.001f;
+	
+	raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(8U);
+	PrintVars.PCB_TEMP = raw_value_Pot;
+	
+	raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(9U);
+	PrintVars.BLDC_TEMP = raw_value_Pot;
 }
 
 /*******************************************************************************
@@ -2095,8 +2181,6 @@ void enable()
     Cy_TCPWM_PWM_Enable(PWM_Counter_W_HW, PWM_Counter_W_NUM);
     Cy_TCPWM_PWM_Enable(SevSw_Counter_HW, SevSw_Counter_NUM);
     Cy_TCPWM_Counter_Enable(Message_Counter_HW, Message_Counter_NUM);
-    NVIC_EnableIRQ(hall_isr12_config.intrSrc);
-    NVIC_EnableIRQ(hall_isr3_config.intrSrc);
     NVIC_EnableIRQ(fifo_isr_cfg.intrSrc);
 }
 
@@ -2280,8 +2364,8 @@ int main(void)
 		
 	    system_fsm_step();
 	    //DebugUart_SendTxPacket();
-	    char print_Array[41];
-    	float32_t data_Array[10] = {PrintVars.we_ref, PrintVars.we, PrintVars.iq_ref, PrintVars.iq, PrintVars.vq, PrintVars.vbus, PrintVars.ibus, (float32_t)count, PrintVars.we_hall, PrintVars.we_OBS};
+	    char print_Array[37];
+    	float32_t data_Array[9] = {PrintVars.we_ref, PrintVars.we, PrintVars.iq, (float32_t)count, PrintVars.Duty*100.0f, PrintVars.we_OBS, PrintVars.we_hall, PrintVars.PCB_TEMP, PrintVars.BLDC_TEMP};
     	print_Array[0] = 0xAA;
     	memcpy(&print_Array[1], data_Array, sizeof(data_Array));
     	for (int i = 0; i < (int)sizeof(print_Array); i++) 
