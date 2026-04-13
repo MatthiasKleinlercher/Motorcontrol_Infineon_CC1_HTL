@@ -230,55 +230,7 @@ enum {
     HALL_FAULT_TIMEOUT       = 1u << 3,
 };
 
-// Communication
-typedef struct
-{
-	float32_t target_speed; //[U/min]
-	float32_t target_torque;	   // [Nm]
-	uint8_t control_mode;
-	uint8_t enable_motor;
-	uint8_t start;
-	uint8_t direction_cc;
-	uint8_t foc;
-	uint8_t sensorless;
-}rx_t;
 
-typedef struct
-{
-    uint16_t speed;         // speed *10
-    uint8_t  torgue;        // torque *100 (aus iq/12)
-
-    uint16_t i_bus;         // value *10
-    uint16_t v_bus;         // value *10
-    uint16_t pcb_temp;      // value *10  (noch nicht vorhanden -> 0)
-    uint16_t winding_temp;  // value *10  (noch nicht vorhanden -> 0)
-    uint16_t id;            // value *10
-    uint16_t iq;            // value *10
-    uint16_t vd;            // value *10
-    uint16_t vq;            // value *10
-
-    uint8_t  signal;        // bit0=error, bit1=warning
-} tx_t;
-
-
-// motor suite gui
-typedef struct
-{
-    volatile uint8_t drive_enable;
-    volatile int8_t  direction_cmd;     // +1 / -1
-    volatile float   speed_ref_rpm;
-    volatile uint8_t estop;
-
-    volatile uint16_t state;
-    volatile float speed_meas_rpm;
-    volatile float id_meas;
-    volatile float iq_meas;
-    volatile float ia;
-    volatile float ib;
-    volatile float ic;
-} motor_gui_if_t;
-
-motor_gui_if_t g_gui = {0};
 
 // Params for pre alignment
 #define M_COARSE              (0.002f)
@@ -351,6 +303,8 @@ typedef struct
 	uint32_t PCB_TEMP;
 	uint32_t BLDC_TEMP;
 }Print_t;
+
+
 /*******************************************************************************
 * Macros
 *******************************************************************************/
@@ -373,10 +327,7 @@ volatile foc_type_t foc_type = FOC_SENSORED;
 typedef enum {	FOC_IQ_CONTROLLED, FOC_SPEED_CONTROLLED} foc_controller_type_t;
 volatile foc_controller_type_t foc_controller_type = FOC_SPEED_CONTROLLED;
 
-volatile bool counterClockwise = 0U; //CCW = true; CW = false;
-volatile float32_t We_ref = 0.0f;
-volatile float32_t Iq_ref = 0.0f;
-volatile float32_t Duty = 0.0f;
+volatile uint8_t Direction_cw = 0U; //CCW == 1U; CW == 0U;
 
 typedef enum {	ENABLE_SYSTEM,
 				DISABLE_SYSTEM,
@@ -425,11 +376,6 @@ volatile float32_t last_imag = 0.0f;       // ADC-ISR writes values in Peak
 // Hall measurement
 static hall_meas_t hall_values = {};
 
-// Communication
-volatile rx_t rxData;
-volatile tx_t txData;
-static rx_t rxPrev = {0};
-
 // Block
 const uint8_t hall_to_lut[8] =
 {
@@ -462,6 +408,32 @@ const float32_t lut_to_theta_sector[6] =
 	-2.0943951,
 	-1.04719755
 };
+
+// For elf:
+volatile float32_t We_ref = 0.0;
+volatile float32_t We = 0.0;
+volatile float32_t Iq_ref = 0.0;
+volatile float32_t Iq = 0.0;
+volatile float32_t Id = 0.0;
+volatile float32_t Vd = 0.0;
+volatile float32_t Vq = 0.0;
+volatile float32_t Duty = 0.0;
+volatile float32_t PCB_Temp = 0.0;
+volatile float32_t BLDC_Temp = 0.0;
+volatile float32_t I_Bus = 0.0;
+volatile float32_t V_Bus = 0.0;
+volatile float32_t Va = 0.0;
+volatile float32_t Vb = 0.0;
+volatile float32_t Vc = 0.0;
+volatile float32_t Ia = 0.0;
+volatile float32_t Ib = 0.0;
+volatile float32_t Ic = 0.0;
+volatile uint8_t Enable = 0U;
+volatile uint8_t Direction_CW = 0U;
+volatile uint8_t FOC = 0U;
+volatile uint8_t Torque_Controlled = 0U;
+volatile uint8_t Start = 0U;
+volatile uint8_t Sensored = 0U;
 
 // Test Vars
 volatile Print_t PrintVars;
@@ -520,14 +492,12 @@ static void init_pi_block_speed(PI_t *s);
 static void system_fsm_step();
 static inline void _Block(float32_t Duty, uint8_t lut_idx, bool direction_is_math_pos);
 static inline void foc_switch_ctrl_methode();
-static inline uint16_t le16(const uint8_t *p);
-bool DebugUart_TryReadPacket(void);
-static inline void wr16le(uint8_t *p, uint16_t v);
-void DebugUart_SendTxPacket(void);
 void sevSw_on();
 void sevSw_off();
-static inline bool _is_foc_group(system_state_t st);
-static inline bool _is_block_group(system_state_t st);
+static inline bool _is_foc_active(system_state_t st);
+static inline bool _is_block_active(system_state_t st);
+static void panel_command_step(void);
+static void panel_command_step(void);
 /*******************************************************************************
 * Function Definitions
 *******************************************************************************/
@@ -549,24 +519,24 @@ static inline bool _is_block_group(system_state_t st);
 *******************************************************************************/
 
 /*******************************************************************************
-* Function Name: static inline float32_t _dir_sign_f(void)
-				 static inline bool _is_foc_group(system_state_t st)
-				 static inline bool _is_block_group(system_state_t st)
+* Function Name: static inline bool _is_foc_active(system_state_t st)
+				 static inline bool _is_block_active(system_state_t st)
 
 * Helpers: State groups
 *******************************************************************************/
 
 
-static inline bool _is_foc_group(system_state_t st)
+static inline bool _is_foc_active(system_state_t st)
 {
-    return (st == SYSTEM_STARTUP_FOC_PREALIGN) || (st == SYSTEM_STARTUP_FOC_OPENLOOP) ||
-           (st == SYSTEM_RUN_FOC) || (st == SYSTEM_SHUTDOWN_FOC_CMD) || (st == SYSTEM_SHUTDOWN_FOC);
+    return (st == SYSTEM_STARTUP_FOC_PREALIGN) ||
+           (st == SYSTEM_STARTUP_FOC_OPENLOOP) ||
+           (st == SYSTEM_RUN_FOC);
 }
 
-static inline bool _is_block_group(system_state_t st)
+static inline bool _is_block_active(system_state_t st)
 {
-    return (st == SYSTEM_STARTUP_BLOCK) || (st == SYSTEM_RUN_BLOCK) ||
-           (st == SYSTEM_SHUTDOWN_BLOCK_CMD) || (st == SYSTEM_SHUTDOWN_BLOCK);
+    return (st == SYSTEM_STARTUP_BLOCK) ||
+           (st == SYSTEM_RUN_BLOCK);
 }
 
 /******************************************************************************/
@@ -1201,7 +1171,14 @@ static inline float32_t _HALL_get_theta(const hall_meas_t* h)
     uint32_t diff = (now - h->last_edge_cnt);
     float32_t dt = (float32_t)diff / (float32_t)SysFreq;
 
-    return _wrap_pi(h->theta_sector + h->we_hall * dt);
+    float32_t dtheta = h->we_hall * dt;
+
+    if (Direction_cw != 0U)
+    {
+        dtheta = -dtheta;
+    }
+
+    return _wrap_pi(h->theta_sector + dtheta);
 }
 
 static inline float32_t _HALL_get_we(hall_meas_t* hall) {return hall->we_hall;}
@@ -1260,7 +1237,7 @@ static inline void _open_loop_step(float32_t *vd, float32_t *vq, float32_t we)
 	
 	*vd = 0.0;
 	*vq = vq_boost + we_ramp * we;
-	if (counterClockwise == true) *vq = -*vq;
+	if (Direction_cw == 0U) *vq = -*vq;
 	if (fabsf(*vq) < 0.0) *vq = 0.0;
 }
 /******************************************************************************/
@@ -1293,32 +1270,11 @@ void controller_counter_intr_handler()
  		we_m = _HALL_get_we(&hall_values);
 		if (system_state == SYSTEM_STARTUP_BLOCK)
 		{
-			static uint16_t count = 0U;
-			static uint16_t count_for_lut = 0U;
-			static uint8_t lut_idx_count = 0U;
-			if (count < 1800U) 
+			duty += OL_DUTY * CALL_TIME/OL_TIME;
+			if (duty >= OL_DUTY)
 			{
-				count++;
-				count_for_lut++;
-				duty = 0.15* (float32_t)count/(float32_t)1800U;
-				
-				if (count_for_lut > 300U)
-				{
-					count_for_lut = 0U;
-					if (counterClockwise == 0U) lut_idx_count--;
-					if (counterClockwise == 1U) lut_idx_count++;
-					if (lut_idx_count > 5U) lut_idx_count = 0U;
-					if (lut_idx_count < 0U) lut_idx_count = 5U;
-				}
-				_Block(duty, lut_idx_count, counterClockwise);
-			}
-			else
- 			{
-				count = 0U;
-				lut_idx_count = 0U;
-				init_pi_block_speed(&c);
-				c.prevU = duty;
 				system_state = SYSTEM_RUN_BLOCK;
+				init_pi_block_speed(&c);
 			}
 		}
 		
@@ -1330,20 +1286,19 @@ void controller_counter_intr_handler()
 				if (fabsf(we_m) <= (20.0f)) system_state = SYSTEM_SHUTDOWN_BLOCK;
 			}
 	        duty =  _pi_controller_step(&c, we_ref, we_m);
-	        _Block(duty, hall_values.lut_idx, counterClockwise);
 	    }
 		
 		else if (system_state == SYSTEM_SHUTDOWN_BLOCK)
 		{
-			_Block(0.0, hall_values.lut_idx, counterClockwise);
 			duty = 0.0;
 			we_m = 0.0;
 	        system_state = SYSTEM_READY;
 		}
-		// Test:
-		PrintVars.we = we_m;
-		PrintVars.Duty = duty;
-		PrintVars.we_ref = we_ref;
+		
+		_Block(duty, hall_values.lut_idx, (Direction_cw != 0U));
+
+		We = we_m;
+		Duty = duty;
 	}
 	
 	// =========================
@@ -1375,14 +1330,15 @@ void controller_counter_intr_handler()
 		
 		if (system_state == SYSTEM_STARTUP_FOC_OPENLOOP)
 		{
-			we += OL_WE * CALL_TIME/OL_TIME;
+			if (Direction_cw == 0U )we += OL_WE * CALL_TIME/OL_TIME;
+			else if (Direction_cw == 1U )we -= OL_WE * CALL_TIME/OL_TIME;
 			th = _wrap_pi(th + CALL_TIME * we);
 			
 			c = cosf(th);
 			s = sinf(th);
 			_park_dq(ialpha, ibeta, s, c, &id, &iq);
 			
-			if (we <= OL_WE) _open_loop_step(&vd, &vq, we);
+			if (fabsf(we) <= OL_WE) _open_loop_step(&vd, &vq, we);
 		    else
 		    {
 		        _open_loop_step(&vd, &vq, we);
@@ -1402,8 +1358,8 @@ void controller_counter_intr_handler()
 			}
 			else if (foc_type == FOC_SENSORLESS)
 			{
-				we = _SMO_GetOmega(&SMO);
-            	th = _SMO_GetTheta(&SMO);		
+			    we = fabsf(_SMO_GetOmega(&SMO));
+			    th = _SMO_GetTheta(&SMO);
 			}
 			
 			c = cosf(th);
@@ -1429,30 +1385,43 @@ void controller_counter_intr_handler()
 		
 		else if (system_state == SYSTEM_SHUTDOWN_FOC)
 		{
-			we -= OL_WE * CALL_TIME/OL_TIME;
-			th = _wrap_pi(th + CALL_TIME * we);
-			
-			c = cosf(th);
-			s = sinf(th);
-			_park_dq(ialpha, ibeta, s, c, &id, &iq);
-			
-			if (we >= 0.0) _open_loop_step(&vd, &vq, we);
+		    float32_t dwe = OL_WE * CALL_TIME / OL_TIME;
+		
+		    if (we > 0.0f)
+		    {
+		        we -= dwe;
+		        if (we < 0.0f) we = 0.0f;
+		    }
+		    else if (we < 0.0f)
+		    {
+		        we += dwe;
+		        if (we > 0.0f) we = 0.0f;
+		    }
+		
+		    if (fabsf(we) > 0.0f)
+		    {
+		        th = _wrap_pi(th + CALL_TIME * we);
+		
+		        c = cosf(th);
+		        s = sinf(th);
+		        _park_dq(ialpha, ibeta, s, c, &id, &iq);
+		
+		        _open_loop_step(&vd, &vq, we);
+		    }
 		    else
 		    {
-				vd = 0.0;
-				vq = 0.0;
-				we = 0.0;
+		        vd = 0.0f;
+		        vq = 0.0f;
+		        we = 0.0f;
 		        system_state = SYSTEM_READY;
 		    }
 		}
 		
-		//Only for testing Print vars
-		PrintVars.we = we;
-		PrintVars.id = id;
-		PrintVars.iq += 0.01*(iq - PrintVars.iq);
-		PrintVars.vq = vq;
-		PrintVars.we_ref = we_ref;
-		PrintVars.iq_ref = iq_ref;
+		We = fabsf(we);
+		Id = id;
+		Iq = iq;
+		Vq = vq;
+		Vd = vd;
 		
 		float32_t valpha, vbeta;
 		_inv_park_ab(vd, vq, s, c, &valpha, &vbeta);
@@ -1690,8 +1659,6 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 	
 	if (intrStatus & CY_HPPASS_INTR_FIFO_0_LEVEL)
     {
-		// Test:
-		Poti_read();
 		
         /* reads all the voltage and current data */
         uint8_t count = Cy_HPPASS_FIFO_ReadAll(ADC_FIFO_IDX, adc_data, adc_chan);
@@ -1705,6 +1672,7 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 		float32_t offset = (iu + iv + iw) / 3.0;
 		iu -= offset;iv -= offset; iw -= offset;
 		adc_meas.iu = iu; adc_meas.iv = iv; adc_meas.iw = iw;
+		Ia = iu, Ib = iv, Ic = iw;
 		adc_meas.idc = -0.028 * (float32_t)adc_data[3] + 57.082;
 		
 		float32_t vu = 0.022 * (float32_t)adc_data[4] - 0.2378;
@@ -1712,12 +1680,18 @@ void pass_0_sar_0_fifo_0_buffer_0_callback()
 		float32_t vw = 0.0219 * (float32_t)adc_data[6] - 0.1021;
 		offset = (vu + vv + vw) / 3.0;
 		vu -= offset; vv -= offset; vw -= offset;
+		Va = vu, Vb = vv, Vc = vw;
 		adc_meas.vu = vu; adc_meas.vv = vu; adc_meas.vu = vw;
 		adc_meas.vdc = 0.022 * (float32_t)adc_data[7] - 0.1133;
 		
-		// Tester:
-		PrintVars.ibus = adc_meas.idc;
-		PrintVars.vbus = adc_meas.vdc;
+		int16_t raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(8U);
+		PCB_Temp = raw_value_Pot;
+	
+		raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(9U);
+		BLDC_Temp = raw_value_Pot;
+		
+		I_Bus = adc_meas.idc;
+		V_Bus = adc_meas.vdc;
 		
 		
         if (system_state == SYSTEM_STARTUP_FOC_PREALIGN && inj_collect_now)
@@ -1798,26 +1772,33 @@ static void system_fsm_step()
 		{
 			if (system_req == START_FOC) 
 			{
+			    Direction_cw = (Direction_CW != 0U) ? 1U : 0U;
+			
+			    foc_controller_type = (Torque_Controlled != 0U) ? FOC_IQ_CONTROLLED : FOC_SPEED_CONTROLLED;
+			    foc_type = (Sensored != 0U) ? FOC_SENSORLESS : FOC_SENSORED;
+			
 			    NVIC_EnableIRQ(hall_isr12_config.intrSrc);
-    			NVIC_EnableIRQ(hall_isr3_config.intrSrc);
-    			_pwm_all_enable();
-				Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
-				Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
-				SMO_Init(&SMO);
-				_prealign_start();
-                NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
-				system_state = SYSTEM_STARTUP_FOC_PREALIGN;
-				system_req = NO_REQ;
+			    NVIC_EnableIRQ(hall_isr3_config.intrSrc);
+			    _pwm_all_enable();
+			    Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
+			    Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
+			    SMO_Init(&SMO);
+			    _prealign_start();
+			    NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
+			    system_state = SYSTEM_STARTUP_FOC_PREALIGN;
+			    system_req = NO_REQ;
 			}
 			else if (system_req == START_BLOCK)
 			{
-				Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
-				Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
-				NVIC_EnableIRQ(hall_isr12_config.intrSrc);
-    			NVIC_EnableIRQ(hall_isr3_config.intrSrc);
-                NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
-				system_state = SYSTEM_STARTUP_BLOCK;
-				system_req = NO_REQ;
+			    Direction_cw = (Direction_CW != 0U) ? 1U : 0U;
+			
+			    Cy_TCPWM_TriggerStart_Single(Test_Counter_HW, Test_Counter_NUM);
+			    Cy_TCPWM_TriggerStart_Single(Controller_Counter_HW, Controller_Counter_NUM);
+			    NVIC_EnableIRQ(hall_isr12_config.intrSrc);
+			    NVIC_EnableIRQ(hall_isr3_config.intrSrc);
+			    NVIC_EnableIRQ(Controller_counter_intr_config.intrSrc);
+			    system_state = SYSTEM_STARTUP_BLOCK;
+			    system_req = NO_REQ;
 			}
 			
 			else if (system_req == DISABLE) system_state = SYSTEM_DISABLE;
@@ -1883,9 +1864,11 @@ static void system_fsm_step()
 		
 		case SYSTEM_DISABLE:
 		{
-			sevSw_off();
-			system_state = SYSTEM_OFF;
-			system_req = NO_REQ;
+		    _pwm_all_disable();
+		    sevSw_off();
+		    disable();
+		    system_state = SYSTEM_OFF;
+		    system_req = NO_REQ;
 		}break;
 		
 		case SYSTEM_FAULT:
@@ -1898,246 +1881,6 @@ static void system_fsm_step()
 	}
 }
 /******************************************************************************/
-
-/*******************************************************************************
-* Function Name: static inline uint16_t le16(const uint8_t *p)
-				 bool DebugUart_TryReadPacket(void)
-				 static inline void wr16le(uint8_t *p, uint16_t v)
-				 static inline void wr32le(uint8_t *p, uint32_t v)
-				 void DebugUart_SendTxPacket(void)
-				 
-* That functions are your to transmit und recieve message between µC and Motorpanel
-*******************************************************************************/
-static inline uint16_t le16(const uint8_t *p)
-{
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-bool DebugUart_TryReadPacket(void)
-{
-    typedef enum
-    {
-        RX_WAIT_CMD = 0,
-        RX_READ_DATA
-    } rx_parse_state_t;
-
-    static rx_parse_state_t state = RX_WAIT_CMD;
-    static uint8_t cmd = 0u;
-    static uint8_t payload[2];
-    static uint8_t idx = 0u;
-    static uint8_t expected_len = 0u;
-
-    bool updated = false;
-
-    while (Cy_SCB_UART_GetNumInRxFifo(DEBUG_UART_HW) != 0u)
-    {
-        uint8_t b = (uint8_t)Cy_SCB_UART_Get(DEBUG_UART_HW);
-
-        if (state == RX_WAIT_CMD)
-        {
-            cmd = b;
-            idx = 0u;
-
-            switch (cmd)
-            {
-                case 0xA0:  // speed -> 16 Bit
-                    expected_len = 2u;
-                    state = RX_READ_DATA;
-                    break;
-                    
-                case 0xA1:  // torque -> 8 Bit
-                    expected_len = 1u;
-                    state = RX_READ_DATA;
-                    break;
-
-                case 0xAA:  // packed flags -> 8 Bit
-                    expected_len = 1u;
-                    state = RX_READ_DATA;
-                    break;
-
-                default:
-                    // unbekanntes Startbyte ignorieren
-                    state = RX_WAIT_CMD;
-                    break;
-            }
-        }
-        else // RX_READ_DATA
-        {
-            payload[idx++] = b;
-
-            if (idx >= expected_len)
-            {
-                switch (cmd)
-                {
-                    case 0xA0:
-                        rxData.target_speed = (float32_t)(le16(payload))/10.0;
-                        updated = true;
-                        
-                        break;
-
-                    case 0xA1:
-					    rxData.target_torque = (float32_t)(payload[0]) / 100.0f;
-					    updated = true;
-					    break;
-
-                    case 0xAA:
-                    {
-                        uint8_t flags = payload[0];
-
-                        // bit0 = ControlMode (1 = speed, 0 = torque)
-                        // bit1 = EnableMotor
-                        // bit2 = StartStop
-                        // bit3 = Direction
-                        // bit4 = FOC/Block
-                        // bit5 = SensorMode
-                        // bit6..7 reserved
-
-                        rxData.control_mode = (flags & (1u << 0)) ? 1u : 0u;
-                        rxData.enable_motor = (flags & (1u << 1)) ? 1u : 0u;
-                        rxData.start        = (flags & (1u << 2)) ? 1u : 0u;
-                        rxData.direction_cc = (flags & (1u << 3)) ? 1u : 0u;
-                        rxData.foc          = (flags & (1u << 4)) ? 1u : 0u;
-                        rxData.sensorless   = (flags & (1u << 5)) ? 1u : 0u;
-						
-                        updated = true;
-                    }
-                    break;
-
-                    default:
-                        break;
-                }
-
-                // für nächstes Telegramm zurücksetzen
-                state = RX_WAIT_CMD;
-                idx = 0u;
-                expected_len = 0u;
-            }
-        }
-    }
-    return updated;
-}
-
-static inline void wr16le(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v & 0xFFu);
-    p[1] = (uint8_t)(v >> 8);
-}
-
-static inline uint16_t _u16_from_x10(float32_t x)
-{
-    if (x <= 0.0f) return 0u;
-    float32_t y = x * 10.0f + 0.5f;
-    if (y > 65535.0f) y = 65535.0f;
-    return (uint16_t)y;
-}
-
-static inline uint8_t _u8_from_x100(float32_t x)
-{
-    if (x <= 0.0f) return 0u;
-    float32_t y = x * 100.0f + 0.5f;
-    if (y > 255.0f) y = 255.0f;
-    return (uint8_t)y;
-}
-
-static void DebugUart_UpdateTxData(void)
-{
-    // Snapshot (kurz IRQ aus, damit keine “halb” geschriebenen floats)
-    float32_t we, ibus, vbus, id, iq, vd, vq;
-    system_state_t st;
-    bool err, warn;
-    float32_t pole_pairs;
-
-    we   = PrintVars.we;      // electrical rad/s (aus ISR gesetzt)
-    ibus = PrintVars.ibus;    // A
-    vbus = PrintVars.vbus;    // V
-    id   = PrintVars.id;      // A (FOC)
-    iq   = PrintVars.iq;      // A (FOC)
-    pole_pairs = (SMO.p > 0.0f) ? SMO.p : 1.0f;
-
-    // Speed aus we -> rpm (mechanisch): rpm = we/(2*pi*p) * 60
-    float32_t speed_rpm = (fabsf(we) / (TWO_PI * pole_pairs)) * 60.0f;
-
-    // torque = iq / 12 (nur sinnvoll in FOC)
-    float32_t torque_nm = 0.0f;
-
-    bool foc_valid = _is_foc_group(st);
-    if (foc_valid)
-    {
-        torque_nm = fabsf(iq) / 12.0f;
-    }
-    else
-    {
-        // Block: iq/torque nicht verfügbar -> 0
-        id = 0.0f; iq = 0.0f; vd = 0.0f; vq = 0.0f;
-    }
-
-    // txData füllen (deine Skalierungsvorgaben)
-    txData.speed = _u16_from_x10(speed_rpm);
-    txData.torgue = _u8_from_x100(torque_nm);
-
-    txData.i_bus = _u16_from_x10(fabsf(ibus));
-    txData.v_bus = _u16_from_x10(fabsf(vbus));
-
-    // Temperaturen sind im Code noch nicht vorhanden
-    txData.pcb_temp = 0u;
-    txData.winding_temp = 0u;
-
-    txData.id = _u16_from_x10(fabsf(id));
-    txData.iq = _u16_from_x10(fabsf(iq));
-    txData.vd = _u16_from_x10(fabsf(vd));
-    txData.vq = _u16_from_x10(fabsf(vq));
-
-    // signal bits
-    uint8_t sig = 0u;
-    if (err)  sig |= (1u << 0);   // LSB = error
-    if (warn) sig |= (1u << 1);   // bit1 = warning
-    txData.signal = sig;
-}
-
-void DebugUart_SendTxPacket(void)
-{
-    // txData aus aktuellen Laufwerten berechnen
-    DebugUart_UpdateTxData();
-
-    const uint8_t TX_PAYLOAD_LEN = 20U;
-    uint8_t buf[1u + TX_PAYLOAD_LEN];
-    uint8_t i = 0u;
-
-    buf[i++] = DBG_STARTBYTE;
-
-    wr16le(&buf[i], txData.speed);        i += 2u;   // uint16_t
-    buf[i++] = txData.torgue;                       // uint8_t
-
-    wr16le(&buf[i], txData.i_bus);        i += 2u;
-    wr16le(&buf[i], txData.v_bus);        i += 2u;
-    wr16le(&buf[i], txData.pcb_temp);     i += 2u;
-    wr16le(&buf[i], txData.winding_temp); i += 2u;
-    wr16le(&buf[i], txData.id);           i += 2u;
-    wr16le(&buf[i], txData.iq);           i += 2u;
-    wr16le(&buf[i], txData.vd);           i += 2u;
-    wr16le(&buf[i], txData.vq);           i += 2u;
-
-    buf[i++] = txData.signal;
-
-    Cy_SCB_UART_PutArray(DEBUG_UART_HW, buf, i);
-}
-
-
-void Poti_read(void)
-{
-
-    int32_t raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(12U);
-    We_ref = (float32_t)raw_value_Pot / 4095.0f * 550.0 + 200.0;
-    
-    raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(10U);
-	Duty = (float32_t)raw_value_Pot / 4095.0f;
-	
-	raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(8U);
-	PrintVars.PCB_TEMP = raw_value_Pot;
-	
-	raw_value_Pot = Cy_HPPASS_SAR_Result_ChannelRead(9U);
-	PrintVars.BLDC_TEMP = raw_value_Pot;
-}
 
 /*******************************************************************************
 * Function Name: void enable()
@@ -2189,6 +1932,118 @@ void disable()
 
 /******************************************************************************/
 
+static void panel_command_step(void)
+{
+    if (system_req != NO_REQ)
+    {
+        return;
+    }
+
+    /* Panel -> gewünschte Betriebsarten übernehmen
+       Falls deine Panel-Logik für Sensored invertiert ist, diese Zeile tauschen. */
+    foc_controller_type = (Torque_Controlled != 0U) ? FOC_IQ_CONTROLLED : FOC_SPEED_CONTROLLED;
+    foc_type = (Sensored != 0U) ? FOC_SENSORLESS : FOC_SENSORED;
+
+    /* 1) Enable / Disable */
+    if (Enable == 0U)
+    {
+        if (_is_foc_active(system_state))
+        {
+            system_req = STOP_FOC;
+            return;
+        }
+
+        if (_is_block_active(system_state))
+        {
+            system_req = STOP_BLOCK;
+            return;
+        }
+
+        if (system_state == SYSTEM_READY)
+        {
+            system_req = DISABLE;
+            return;
+        }
+
+        return;
+    }
+
+    if ((Enable == 1U) && (system_state == SYSTEM_OFF))
+    {
+        system_req = ENABLE;
+        return;
+    }
+
+    /* 2) Start nur aus READY */
+    if (system_state == SYSTEM_READY)
+    {
+        if (Start == 1U)
+        {
+            if (FOC == 1U)
+            {
+                system_req = START_FOC;
+            }
+            else
+            {
+                system_req = START_BLOCK;
+            }
+        }
+        return;
+    }
+
+    /* 3) Wenn Start zurückgenommen wird -> stoppen */
+    if (Start == 0U)
+    {
+        if (_is_foc_active(system_state))
+        {
+            system_req = STOP_FOC;
+            return;
+        }
+
+        if (_is_block_active(system_state))
+        {
+            system_req = STOP_BLOCK;
+            return;
+        }
+
+        return;
+    }
+
+    /* 4) Richtungswechsel während Betrieb:
+          aktuelle Methode stoppen, nach READY automatisch neu starten */
+    if (_is_foc_active(system_state))
+    {
+        if (Direction_CW != Direction_cw)
+        {
+            system_req = STOP_FOC;
+            return;
+        }
+
+        /* optional: Methode bei laufendem Betrieb wechseln */
+        if (FOC == 0U)
+        {
+            system_req = START_BLOCK;
+            return;
+        }
+    }
+
+    if (_is_block_active(system_state))
+    {
+        if (Direction_CW != Direction_cw)
+        {
+            system_req = STOP_BLOCK;
+            return;
+        }
+
+        /* optional: Methode bei laufendem Betrieb wechseln */
+        if (FOC == 1U)
+        {
+            system_req = START_FOC;
+            return;
+        }
+    }
+}
+
 /*******************************************************************************
 * Function Name: void init(void)
 
@@ -2239,8 +2094,6 @@ void init()
     
     /*for sending Messages to Motorpanel*/
     if(result != Cy_TCPWM_Counter_Init(Message_Counter_HW,Message_Counter_NUM, &Message_Counter_config)) { CY_ASSERT(0); }
-    Cy_SysInt_Init(&Uart_intr_config, DebugUart_SendTxPacket);
-    //NVIC_EnableIRQ(Uart_intr_config.intrSrc);
 
     /* Halls & Button init*/
     Cy_GPIO_Pin_Init(HALL1_PORT, HALL1_PIN, &HALL1_config);
@@ -2282,14 +2135,21 @@ int main(void)
 	foc_controller_type = FOC_SPEED_CONTROLLED;
 	foc_type = FOC_SENSORED;
 	Iq_ref = 0.0;
-
-	uint8_t sw1_prev = 1u;
-    uint8_t sw2_prev = 1u;
-    static uint8_t count = 0U;
 	
     for (;;)
     {
-        uint8_t sw1 = (uint8_t)Cy_GPIO_Read(SW1_PORT, SW1_NUM);
+	    panel_command_step();
+		system_fsm_step();
+    }
+}
+
+	    /*
+	    uint8_t sw1_prev = 1u;
+	    uint8_t sw2_prev = 1u;
+	    static uint8_t count = 0U;
+	    //for(;;)
+	    
+	    uint8_t sw1 = (uint8_t)Cy_GPIO_Read(SW1_PORT, SW1_NUM);
         uint8_t sw2 = (uint8_t)Cy_GPIO_Read(SW2_PORT, SW2_NUM);
 
         bool sw1_press = (sw1_prev == 1u) && (sw1 == 0u);
@@ -2304,54 +2164,19 @@ int main(void)
 			if(count > 3U) count = 0U;
 		}
 		
-		if (system_req == NO_REQ)
-		{
-			switch (system_state) 
-			{
-				case SYSTEM_OFF:
-				{
-					if (count == 0U && sw2_press) system_req = ENABLE;
-				}break;
-				
-				case SYSTEM_READY:
-				{
-					if (count == 0U && sw2_press) system_req = START_FOC;
-					else if (count == 1U && sw2_press) system_req = START_BLOCK;
-					else if (count == 2U && sw2_press) system_req = DISABLE;
-				}break;
-				
-				case SYSTEM_RUN_FOC:
-				{
-					if (count == 0U && sw2_press) system_req = STOP_FOC;
-					else if (count == 1U && sw2_press) system_req = SWITCH_CONTROLLER_METHODE;
-					else if (count == 2U && sw2_press) system_req = SWITCH_CTRL_METHODE;
-					else if (count == 3U && sw2_press) system_req = START_BLOCK;
-				}break;
-				
-				case SYSTEM_RUN_BLOCK:
-				{
-					if (count == 0U && sw2_press) system_req = STOP_BLOCK;
-					else if (count == 1U && sw2_press) system_req = START_BLOCK;
-				}break;
-			}
-		}
-
-		
-		
-		
-	    system_fsm_step();
-	    //DebugUart_SendTxPacket();
-	    char print_Array[37];
-    	float32_t data_Array[9] = {PrintVars.we_ref, PrintVars.we, PrintVars.iq, (float32_t)count, PrintVars.Duty*100.0f, PrintVars.we_OBS, alpha, PrintVars.PCB_TEMP, PrintVars.BLDC_TEMP};
+		if (sw2_press) count = 0U;
+	    
+	    PCB_Temp = 40.0;
+		BLDC_Temp = 60.0;
+	    
+	    char print_Array[33];
+    	float32_t data_Array[8] = {(float32_t)Enable, (float32_t)Start, We_ref, Iq_ref, (float32_t)Direction_CW, (float32_t)FOC, (float32_t)Torque_Controlled, (float32_t)Sensored};
     	print_Array[0] = 0xAA;
     	memcpy(&print_Array[1], data_Array, sizeof(data_Array));
     	for (int i = 0; i < (int)sizeof(print_Array); i++) 
     	{ 
 			printf("%c", print_Array[i]); 
 		}
-    }
-}
-
-
+		*/
 
 /* [] END OF FILE */
